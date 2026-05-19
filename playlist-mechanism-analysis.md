@@ -286,9 +286,13 @@ func (r *playlistTrackRepository) Reorder(pos int, newPos int) error {
 |------|----------|----------|----------|
 | 创建/替换 | `Put(pls *Playlist)` | `WithTxImmediate` | 先存元数据，再调用 `updateTracks` |
 | 添加歌曲 | `Tracks().Add(ids)` | 无（单条SQL） | 查询 `max(id)`，调用 `addTracks` 追加 |
+| 按专辑添加 | `Tracks().AddAlbums(ids)` | 无 | 查询专辑歌曲后调用 `Add` |
+| 按艺术家添加 | `Tracks().AddArtists(ids)` | 无 | 查询艺术家歌曲后调用 `Add` |
+| 按碟片添加 | `Tracks().AddDiscs(ids)` | 无 | 查询碟片歌曲后调用 `Add` |
 | 删除歌曲 | `Tracks().Delete(ids)` | `WithTx` | 删除后调用 `renumber()` 重编号 |
 | 重排序 | `Tracks().Reorder(pos, newPos)` | `WithTx` | 四步算法原地调整 |
 | 更新元数据 | `Put(pls, cols...)` | 无 | 仅更新指定字段（名称、注释、公开状态） |
+| 先删后加更新 | `Update(playlistID, ...)` | `WithTxImmediate` | 先 Delete 再 Add，中间自动 renumber |
 | 统计刷新 | `refreshCounters(pls)` | 无 | 聚合查询更新 duration/size/song_count |
 | 孤儿清理 | `removeOrphans()` | `WithTx` (GC内) | 删除无效引用 + renumber |
 
@@ -340,12 +344,14 @@ func (s *SQLStore) WithTxImmediate(block func(tx model.DataStore) error, scope .
 | 操作 | 事务模式 | 原因 |
 |------|----------|------|
 | Create | `WithTxImmediate` | 可能同时写入 playlist 和 playlist_tracks，避免并发创建死锁 |
-| Update (track changes) | `WithTxImmediate` | 涉及多个表修改 |
+| Update (先删后加) | `WithTxImmediate` | 删除 + renumber + 添加 必须原子执行 |
 | Update (metadata only) | 无事务 | 单条 UPDATE，原子性由SQLite保证 |
 | Delete (playlist) | 无事务 | 单条 DELETE + 文件系统操作（非事务） |
 | RemoveTracks | `WithTx` | 删除 + renumber 需要原子性 |
 | ReorderTrack | `WithTx` | 四条 UPDATE 必须原子执行 |
 | AddTracks | 无事务 | 单条 INSERT（分块时多条，但无状态依赖） |
+| AddAlbums/AddArtists/AddDiscs | 无事务 | 先查询再插入，独立操作无外层事务 |
+| **Native 批量添加四类来源** | **无外层事务** | **四类来源顺序执行，部分失败不回滚** |
 | GC/removeOrphans | `WithTx` (外层) | 整个GC过程在一个大事务中 |
 
 ### 5.3 事务嵌套支持
@@ -362,9 +368,362 @@ SQLite 不支持真正的嵌套事务，这里通过新建连接模拟。
 
 ---
 
-## 6. 删除歌曲后的列表修复机制
+## 6. Native 批量添加四类来源的事务边界与部分成功风险
 
-### 6.1 两种删除场景
+### 6.1 四类添加来源
+
+Native API 支持同时从四个来源批量添加歌曲，入口在 `server/nativeapi/playlists.go:121-167` 的 `addToPlaylist` 方法：
+
+```go
+type addTracksPayload struct {
+    Ids       []string       `json:"ids"`       // 直接指定歌曲ID
+    AlbumIds  []string       `json:"albumIds"`  // 按专辑添加
+    ArtistIds []string       `json:"artistIds"` // 按艺术家添加
+    Discs     []model.DiscID `json:"discs"`     // 按碟片添加
+}
+
+func addToPlaylist(pls playlists.Playlists) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        // ... 解析 payload
+        
+        count, c := 0, 0
+        if c, err = pls.AddTracks(ctx, playlistId, payload.Ids); err != nil {
+            http.Error(w, err.Error(), http.StatusBadRequest)
+            return
+        }
+        count += c
+        if c, err = pls.AddAlbums(ctx, playlistId, payload.AlbumIds); err != nil {
+            http.Error(w, err.Error(), http.StatusBadRequest)
+            return
+        }
+        count += c
+        if c, err = pls.AddArtists(ctx, playlistId, payload.ArtistIds); err != nil {
+            http.Error(w, err.Error(), http.StatusBadRequest)
+            return
+        }
+        count += c
+        if c, err = pls.AddDiscs(ctx, playlistId, payload.Discs); err != nil {
+            http.Error(w, err.Error(), http.StatusBadRequest)
+            return
+        }
+        count += c
+        
+        // 返回成功添加的总数
+        _, err = fmt.Fprintf(w, `{"added":%d}`, count)
+    }
+}
+```
+
+### 6.2 各来源的解析与添加流程
+
+四类来源最终都通过 `addMediaFileIds` 方法统一处理（`persistence/playlist_track_repository.go:161-189`）：
+
+```go
+func (r *playlistTrackRepository) addMediaFileIds(cond Sqlizer) (int, error) {
+    // 先根据条件查询出所有符合的媒体文件ID
+    sq := Select("id").From("media_file").Where(cond).
+        OrderBy("album_artist, album, release_date, disc_number, track_number")
+    var ids []string
+    err := r.queryAllSlice(sq, &ids)
+    if err != nil {
+        return 0, err
+    }
+    // 再调用 Add 方法批量添加
+    return r.Add(ids)
+}
+
+func (r *playlistTrackRepository) AddAlbums(albumIds []string) (int, error) {
+    return r.addMediaFileIds(Eq{"album_id": albumIds})
+}
+
+func (r *playlistTrackRepository) AddArtists(artistIds []string) (int, error) {
+    return r.addMediaFileIds(Eq{"album_artist_id": artistIds})
+}
+
+func (r *playlistTrackRepository) AddDiscs(discs []model.DiscID) (int, error) {
+    var clauses Or
+    for _, d := range discs {
+        clauses = append(clauses, And{
+            Eq{"album_id": d.AlbumID},
+            Eq{"release_date": d.ReleaseDate},
+            Eq{"disc_number": d.DiscNumber},
+        })
+    }
+    return r.addMediaFileIds(clauses)
+}
+```
+
+**添加顺序**：
+1. Ids → 按传入顺序添加
+2. AlbumIds → 按 `album_artist, album, release_date, disc_number, track_number` 排序后添加
+3. ArtistIds → 同上排序
+4. Discs → 同上排序
+
+### 6.3 事务边界分析
+
+**核心问题**：四类添加操作**没有外层事务包裹**，每个 `AddXxx` 调用都是独立的。
+
+各方法的事务边界：
+
+```go
+// core/playlists/playlists.go:246-272
+func (s *playlists) AddTracks(ctx context.Context, playlistID string, ids []string) (int, error) {
+    if _, err := s.checkTracksEditable(ctx, playlistID); err != nil {
+        return 0, err
+    }
+    return s.ds.Playlist(ctx).Tracks(playlistID, false).Add(ids)  // 无事务
+}
+
+func (s *playlists) AddAlbums(ctx context.Context, playlistID string, albumIds []string) (int, error) {
+    if _, err := s.checkTracksEditable(ctx, playlistID); err != nil {
+        return 0, err
+    }
+    return s.ds.Playlist(ctx).Tracks(playlistID, false).AddAlbums(albumIds)  // 无事务
+}
+// AddArtists 和 AddDiscs 同理
+```
+
+**Add 方法内部**（`persistence/playlist_track_repository.go:143-159`）：
+```go
+func (r *playlistTrackRepository) Add(mediaFileIds []string) (int, error) {
+    // 查询 max(id) - 单条SQL
+    sq := r.newSelect().Columns("max(id) as max").Where(Eq{"playlist_id": r.playlistId})
+    // ...
+    
+    // 分块插入 - 多条SQL但无事务包裹
+    return len(mediaFileIds), r.playlistRepo.addTracks(r.playlistId, int(res.Max.Int32+1), mediaFileIds)
+}
+```
+
+### 6.4 部分成功风险
+
+**风险场景**：
+1. 请求同时包含 `ids: ["track1", "track2"]` 和 `albumIds: ["album1"]`
+2. `AddTracks` 成功添加了2首歌
+3. `AddAlbums` 查询 `album1` 的歌曲时出错（如数据库连接问题）
+4. 整个请求返回错误，但 **track1 和 track2 已经永久添加到播放列表**
+
+**风险级别**：高
+- 用户看到错误提示，以为全部失败
+- 实际上部分歌曲已添加
+- 再次请求会导致重复添加
+
+**设计意图分析**：
+- 追求性能：避免大事务锁定数据库
+- 简化实现：四类来源独立处理
+- 但牺牲了原子性，属于典型的"性能 vs 一致性"权衡
+
+---
+
+## 7. 先删后加路径对最终顺序的影响
+
+### 7.1 先删后加的代码路径
+
+Subsonic API 的 `UpdatePlaylist` 方法支持同时删除和添加歌曲，核心逻辑在 `core/playlists/playlists.go:152-199`：
+
+```go
+func (s *playlists) Update(ctx context.Context, playlistID string,
+    name *string, comment *string, public *bool,
+    idsToAdd []string, idxToRemove []int) error {
+    
+    return s.ds.WithTxImmediate(func(tx model.DataStore) error {
+        repo := tx.Playlist(ctx)
+
+        if len(idxToRemove) > 0 {
+            tracksRepo := repo.Tracks(playlistID, false)
+            // 将0-based索引转换为1-based位置ID
+            positions := make([]string, len(idxToRemove))
+            for i, idx := range idxToRemove {
+                positions[i] = strconv.Itoa(idx + 1)
+            }
+            // 第一步：删除指定位置的歌曲
+            if err := tracksRepo.Delete(positions...); err != nil {
+                return err
+            }
+            // 第二步：删除后自动 renumber（在 Delete 内部调用）
+            // 第三步：添加新歌曲（追加到末尾）
+            if len(idsToAdd) > 0 {
+                if _, err := tracksRepo.Add(idsToAdd); err != nil {
+                    return err
+                }
+            }
+            return s.updateMetadata(ctx, tx, pls, name, comment, public)
+        }
+
+        // 只有添加没有删除的情况
+        if len(idsToAdd) > 0 {
+            if _, err := repo.Tracks(playlistID, false).Add(idsToAdd); err != nil {
+                return err
+            }
+        }
+        // ...
+    })
+}
+```
+
+### 7.2 对最终顺序的影响
+
+**关键观察**：删除后立即 renumber，然后添加的歌曲追加到末尾。
+
+**示例**：
+假设播放列表原有顺序：[A, B, C, D, E]（位置1-5）
+
+请求：`idxToRemove=[1, 3]`（删除B和D，0-based索引），`idsToAdd=[X, Y]`
+
+执行流程：
+1. 转换索引：`idxToRemove=[1,3]` → `positions=["2","4"]`（位置ID）
+2. 删除位置2和4 → 临时状态：[A, C, E]（位置1,3,5，有间隙）
+3. **Delete 内部调用 renumber** → 重编号为：[A(1), C(2), E(3)]
+4. **Add 追加 X, Y** → 查询 `max(id)=3`，从位置4开始添加
+5. 最终顺序：[A, C, E, X, Y]
+
+**重要结论**：
+- 删除的位置基于**操作前**的播放列表状态
+- 添加的歌曲总是在**删除并修复后**的列表末尾追加
+- 新增歌曲永远不会插入到被删除的位置
+
+### 7.3 索引转换的正确性
+
+代码注释明确说明了转换逻辑：
+```go
+// Convert 0-based indices to 1-based position IDs and delete them directly,
+// avoiding the need to load all tracks into memory.
+```
+
+**为什么不需要先加载所有 tracks？**
+- Subsonic API 约定 `songIndexToRemove` 是基于当前播放列表的 0-based 索引
+- 直接转换为 1-based 位置ID即可删除
+- 但这要求调用方确保索引是基于最新状态的
+
+---
+
+## 8. Subsonic 与 Native 在删除参数语义上的差异及其与重编号的关系
+
+### 8.1 两种 API 的删除参数对比
+
+| API | 参数名称 | 语义 | 类型 |
+|-----|----------|------|------|
+| **Subsonic** | `songIndexToRemove` | 0-based **索引**（基于当前列表顺序） | `[]int` |
+| **Native** | `id` | 1-based **位置ID**（数据库中的 `playlist_tracks.id`） | `[]string` |
+
+### 8.2 Subsonic 删除流程
+
+**入口**：`server/subsonic/playlists.go:97-128` 的 `UpdatePlaylist`
+
+```go
+func (api *Router) UpdatePlaylist(r *http.Request) (*responses.Subsonic, error) {
+    p := req.Params(r)
+    playlistId, _ := p.String("playlistId")
+    songsToAdd, _ := p.Strings("songIdToAdd")
+    songIndexesToRemove, _ := p.Ints("songIndexToRemove")  // 0-based 索引数组
+    
+    // 传递给 service 层
+    err = api.playlists.Update(r.Context(), playlistId, plsName, comment, public, songsToAdd, songIndexesToRemove)
+    // ...
+}
+```
+
+**Service 层处理**：`core/playlists/playlists.go:169-176`
+
+```go
+if len(idxToRemove) > 0 {
+    tracksRepo := repo.Tracks(playlistID, false)
+    // 0-based 索引 → 1-based 位置ID
+    positions := make([]string, len(idxToRemove))
+    for i, idx := range idxToRemove {
+        positions[i] = strconv.Itoa(idx + 1)
+    }
+    if err := tracksRepo.Delete(positions...); err != nil {
+        return err
+    }
+    // ...
+}
+```
+
+### 8.3 Native 删除流程
+
+**入口**：`server/nativeapi/playlists.go:101-119` 的 `deleteFromPlaylist`
+
+```go
+func deleteFromPlaylist(pls playlists.Playlists) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        p := req.Params(r)
+        playlistId, _ := p.String(":playlistId")
+        ids, _ := p.Strings("id")  // 直接是位置ID字符串
+        
+        err := pls.RemoveTracks(r.Context(), playlistId, ids)
+        // ...
+    }
+}
+```
+
+**Service 层直接传递**：`core/playlists/playlists.go:274-281`
+
+```go
+func (s *playlists) RemoveTracks(ctx context.Context, playlistID string, trackIds []string) error {
+    if _, err := s.checkTracksEditable(ctx, playlistID); err != nil {
+        return err
+    }
+    return s.ds.WithTx(func(tx model.DataStore) error {
+        return tx.Playlist(ctx).Tracks(playlistID, false).Delete(trackIds...)  // 直接用传入的 ids
+    })
+}
+```
+
+### 8.4 与重编号的关系
+
+**Subsonic 索引的脆弱性**：
+
+Subsonic 的 `songIndexToRemove` 是基于"播放列表当前顺序"的索引，但这个索引只在**调用时**有效。如果在调用前播放列表被修改过（如其他用户添加/删除歌曲），索引会错位。
+
+**示例**：
+1. 用户A看到播放列表：[A, B, C]（索引0,1,2）
+2. 用户B在此时删除了歌曲A
+3. 实际列表变为：[B, C]（位置1,2）
+4. 用户A发送请求删除索引1（想删B）
+5. 服务端转换：索引1 → 位置ID "2"
+6. 删除位置2 → 实际删除了C，而不是B！
+
+**Native API 的优势**：
+
+Native API 直接使用位置ID（`playlist_tracks.id`），即使列表被修改，只要该位置的歌曲还在，就能正确删除。如果位置已不存在，SQL 的 `WHERE id IN (...)` 只会忽略不存在的ID。
+
+### 8.5 批量删除的顺序问题
+
+**Subsonic 批量删除多个索引**：
+
+假设列表：[A, B, C, D, E]（索引0-4）
+请求删除索引：[1, 3]（想删B和D）
+
+```go
+idxToRemove = [1, 3]
+// 转换为 positions = ["2", "4"]
+// SQL: DELETE FROM playlist_tracks WHERE playlist_id = ? AND id IN ("2", "4")
+```
+
+这是正确的，因为：
+- 删除操作是基于**原始位置**的
+- `IN` 操作不关心参数顺序
+- 删除后 renumber 会修复间隙
+
+**但如果索引是乱序的**：
+`idxToRemove = [3, 1]` → `positions = ["4", "2"]` → 结果相同，不影响正确性
+
+### 8.6 关键差异总结
+
+| 维度 | Subsonic API | Native API |
+|------|-------------|------------|
+| 参数类型 | 0-based 索引数组 | 1-based 位置ID字符串数组 |
+| 转换层 | Service 层 `idx+1` 转换 | 无转换，直接传递 |
+| 并发安全性 | 低（索引可能错位） | 高（位置ID稳定） |
+| 与 renumber 关系 | 依赖 renumber 保持索引连续 | 不依赖，直接操作位置ID |
+| 批量删除顺序 | 不影响结果 | 不影响结果 |
+
+---
+
+## 9. 删除歌曲后的列表修复机制
+
+### 9.1 两种删除场景
 
 Navidrome 有两种歌曲删除场景，修复机制不同：
 
@@ -399,7 +758,7 @@ func (r *playlistTrackRepository) Delete(ids ...string) error {
 
 当媒体文件被扫描器检测到不存在并删除时，`playlist_tracks` 表中会产生**孤儿记录**（`media_file_id` 指向不存在的记录）。
 
-### 6.2 孤儿清理触发时机
+### 9.2 孤儿清理触发时机
 
 孤儿清理是垃圾回收（GC）的一部分，触发链如下：
 
@@ -431,7 +790,7 @@ err := run.Sequentially(
 )
 ```
 
-### 6.3 孤儿清理实现
+### 9.3 孤儿清理实现
 
 `playlist_repository.go:353-384` 的 `removeOrphans` 方法：
 
@@ -471,7 +830,7 @@ func (r *playlistRepository) removeOrphans() error {
 }
 ```
 
-### 6.4 重编号（renumber）算法
+### 9.4 重编号（renumber）算法
 
 `playlist_repository.go:389-411` 的 `renumber` 方法采用**两步CTE算法**避免唯一约束冲突：
 
@@ -519,7 +878,7 @@ func (r *playlistRepository) renumber(id string) error {
 
 ---
 
-## 7. 统计信息刷新机制
+## 10. 统计信息刷新机制
 
 `playlist_repository.go:249-279` 的 `refreshCounters` 方法：
 
@@ -564,9 +923,9 @@ func (r *playlistRepository) refreshCounters(pls *model.Playlist) error {
 
 ---
 
-## 8. 关键设计决策总结
+## 11. 关键设计决策总结
 
-### 8.1 用 id 存储顺序的优缺点
+### 11.1 用 id 存储顺序的优缺点
 
 **优点**：
 - 简单直接，查询时 `ORDER BY playlist_tracks.id` 即可获得正确顺序
@@ -578,7 +937,7 @@ func (r *playlistRepository) refreshCounters(pls *model.Playlist) error {
 - 重排序需要复杂的多步操作避免唯一约束冲突
 - 批量删除后重编号成本 O(n)
 
-### 8.2 性能优化策略
+### 11.2 性能优化策略
 
 | 优化点 | 实现方式 |
 |--------|----------|
@@ -587,14 +946,14 @@ func (r *playlistRepository) refreshCounters(pls *model.Playlist) error {
 | 智能播放列表延迟更新 | Put 时不更新 tracks，由后台进程异步刷新 |
 | 统计信息聚合 | 使用 SQL SUM/COUNT 一次性计算，避免内存遍历 |
 
-### 8.3 权限模型
+### 11.3 权限模型
 
 - 播放列表有 `OwnerID` 和 `Public` 字段
 - 非管理员用户只能修改自己的播放列表
 - 智能播放列表的 tracks 不可直接修改（`IsSmartPlaylist()` 检查）
 - `checkWritable` 和 `checkTracksEditable` 统一权限校验
 
-### 8.4 并发安全
+### 11.4 并发安全
 
 - 写操作使用 `WithTxImmediate` 避免 SQLite 死锁
 - 所有修改操作在事务中执行，保证原子性
@@ -602,7 +961,7 @@ func (r *playlistRepository) refreshCounters(pls *model.Playlist) error {
 
 ---
 
-## 9. 核心代码路径汇总
+## 12. 核心代码路径汇总
 
 | 功能 | 文件位置 | 行号 |
 |------|----------|------|
@@ -621,10 +980,17 @@ func (r *playlistRepository) refreshCounters(pls *model.Playlist) error {
 | 立即事务 WithTxImmediate | `persistence/persistence.go` | 156-168 |
 | 数据模型 Playlist | `model/playlist.go` | 12-33 |
 | 数据模型 PlaylistTrack | `model/playlist.go` | 136-141 |
+| **Update 先删后加逻辑** | `core/playlists/playlists.go` | 152-199 |
+| **Native 批量添加入口** | `server/nativeapi/playlists.go` | 121-167 |
+| **四类来源 addMediaFileIds** | `persistence/playlist_track_repository.go` | 161-189 |
+| **Subsonic UpdatePlaylist** | `server/subsonic/playlists.go` | 97-128 |
+| **Native deleteFromPlaylist** | `server/nativeapi/playlists.go` | 101-119 |
+| **RemoveTracks Service** | `core/playlists/playlists.go` | 274-281 |
+| **AddTracks/AddAlbums Service** | `core/playlists/playlists.go` | 246-272 |
 
 ---
 
-## 10. 数据库表结构（简化）
+## 13. 数据库表结构（简化）
 
 ```sql
 CREATE TABLE playlist (
