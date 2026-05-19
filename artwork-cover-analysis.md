@@ -871,22 +871,97 @@ selectImageReader()  ── 按顺序尝试 sourceFunc 列表
                                                     └─► 返回艺术家占位图
 ```
 
-**外部来源缓存与落盘机制**（`core/external/provider.go:373-402`）：
+**外部来源缓存与落盘机制**
 
-**艺术家图片（ArtistImage）**：
-- DB 中无缓存 URL 时：同步调用 `callGetImage()` 获取 URL，**仅更新内存结构体，不写入数据库**
-- DB 中有缓存 URL 时：直接返回 URL
-- 过期触发：`time.Since(ExternalInfoUpdatedAt) > DevArtistInfoTimeToLive` 时，入队列**后台异步刷新**
-- **落盘时机**：仅在 `populateArtistInfo()` 中写入 DB，该方法由 `UpdateArtistInfo()` 或后台刷新队列调用
+**两层缓存架构**：
 
-**专辑图片（AlbumImage）**：
-- **无缓存机制**：每次调用都实时从 Agent 获取，不检查 DB 缓存
-- **不落盘**：获取到的 URL 直接返回，不写入数据库
-- 落盘时机：仅在 `populateAlbumInfo()` 中写入 DB
+Navidrome 的外部封面有两层独立的缓存机制：
+
+| 缓存层级 | 存储位置 | 内容 | 失效机制 |
+|----------|----------|------|----------|
+| **文件缓存** | `cache/images/` 目录 | 实际的图片二进制文件 | LRU 策略 + 缓存键中的时间戳 |
+| **元数据缓存** | 数据库 `artist`/`album` 表 | 图片 URL 字符串 | TTL 过期 + 后台刷新 |
+
+---
+
+**艺术家图片（ArtistImage）落盘时机**（`core/external/provider.go:373-402`）：
+
+```
+封面请求 → ArtistImage()
+    │
+    ├─ DB 中有 LargeImageUrl → 直接返回 URL（不落盘）
+    │       │
+    │       └─ 检查过期：time.Since(ExternalInfoUpdatedAt) > TTL
+    │               ├─ 未过期 → 返回
+    │               └─ 已过期 → 入队列后台刷新（异步落盘）
+    │
+    └─ DB 中无 LargeImageUrl → 同步调用 Agent 获取 URL
+            │
+            ├─ 获取成功 → 更新内存结构体 → 返回 URL（**不落盘**）
+            └─ 获取失败 → 返回 ErrNotFound
+```
+
+**落盘时机**：仅在以下场景写入数据库：
+1. 调用 `UpdateArtistInfo()` API 时，首次获取或后台刷新
+2. 后台刷新队列处理时（`populateArtistInfo`）
+
+---
+
+**专辑图片（AlbumImage）落盘时机**（`core/external/provider.go:404-441`）：
+
+```
+封面请求 → AlbumImage()
+    │
+    └─ 每次都同步调用 Agent 获取（不检查 DB 缓存）
+            │
+            ├─ 获取成功 → 返回 URL（**永不落盘**）
+            └─ 获取失败 → 返回 ErrNotFound
+```
+
+**落盘时机**：仅在调用 `UpdateAlbumInfo()` API 时写入数据库
+
+---
+
+**文件缓存（FileCache）落盘时机**（`utils/cache/file_caches.go:165-181`）：
+
+```
+GetCoverArt API → GetOrPlaceholder() → Get() → cache.Get()
+    │
+    ├─ 缓存命中 → 直接返回缓存文件
+    │
+    └─ 缓存未命中 → 调用 artworkReader.Reader() 获取图片
+            │
+            ├─ 获取成功 → 异步写入文件缓存（后台 goroutine）
+            └─ 获取失败 → 返回错误
+```
+
+**文件缓存特性**：
+- 缓存目录：`{CacheFolder}/images/`
+- 最大条目：`consts.DefaultImageCacheMaxItems`
+- 清理策略：LRU（最近最少使用）
+- 无 TTL：依赖缓存键中的时间戳实现逻辑失效
+
+---
 
 **缓存时效默认值**（`consts/consts.go:61-62`）：
 - `DevArtistInfoTimeToLive`：**24 小时**
 - `DevAlbumInfoTimeToLive`：**7 天**
+
+**刷新触发条件**：
+
+| 触发场景 | 检查条件 | 行为 |
+|----------|----------|------|
+| `UpdateArtistInfo()` 调用 | `ExternalInfoUpdatedAt` 为零值 | 同步调用 `populateArtistInfo()` 落盘 |
+| `UpdateArtistInfo()` 调用 | `time.Since(updatedAt) > TTL` | 入队列后台异步刷新 |
+| `ArtistImage()` 调用 | DB 有 URL 且过期 | 入队列后台异步刷新 |
+| `UpdateAlbumInfo()` 调用 | `ExternalInfoUpdatedAt` 为零值 | 同步调用 `populateAlbumInfo()` 落盘 |
+| `UpdateAlbumInfo()` 调用 | `time.Since(updatedAt) > TTL` | 入队列后台异步刷新 |
+| 后台刷新队列 | 每 5 秒处理一个任务 | 调用 `populateXxxInfo()` 落盘 |
+
+**后台刷新队列参数**（`core/external/provider.go:28-30`）：
+- `refreshDelay`：5 秒（处理间隔）
+- `refreshTimeout`：15 秒（单个任务超时）
+- `refreshQueueLength`：2000（队列最大长度）
 
 ---
 
@@ -1144,5 +1219,9 @@ if err != nil || resized == nil {
 | 外部图片 HTTP 客户端 | `core/artwork/sources.go` | 212-225 |
 | Agent 列表构建 | `core/agents/agents.go` | 58-97 |
 | Agent 聚合器核心循环 | `core/agents/agents.go` | 322-345 |
-| 艺术家图片获取（含缓存） | `core/external/provider.go` | 373-402 |
-| 默认配置值 | `conf/configuration.go` | 750-772 |
+| 艺术家图片获取（不落盘） | `core/external/provider.go` | 373-402 |
+| 专辑图片获取（不缓存） | `core/external/provider.go` | 404-441 |
+| 艺术家信息落盘（含图片） | `core/external/provider.go` | 247-281 |
+| 专辑信息落盘（含图片） | `core/external/provider.go` | 143-189 |
+| 缓存时效默认值 | `consts/consts.go` | 61-62 |
+| 默认配置值 | `conf/configuration.go` | 750-772、870-871 |
