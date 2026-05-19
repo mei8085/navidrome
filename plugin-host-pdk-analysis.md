@@ -41,7 +41,7 @@ Navidrome 采用 **Extism + Wazero** 技术栈构建 WebAssembly 插件体系，
 | **插件生命周期管理** | 加载、卸载、启用、禁用、热重载 | `manager.go`, `manager_loader.go` |
 | **WASM 运行时环境** | 基于 Wazero + Extism 提供沙箱执行 | `manager_plugin.go` |
 | **宿主服务暴露** | 向插件注册可调用的宿主函数 | `host/*_gen.go`, `manager_loader.go:40-148` |
-| **权限控制** | 根据 manifest 声明过滤可用服务 | `manager_loader.go:329-337` |
+| **权限控制** | 根据 manifest 声明过滤可用服务 | `manager_loader.go:319-337` |
 | **能力检测** | 自动识别插件导出函数映射的能力 | `capabilities.go:24-36` |
 | **错误隔离与恢复** | panic 捕获、超时控制、实例隔离 | `manager_loader.go:201-206`, `manager_call.go` |
 | **资源管理** | 编译缓存、文件系统挂载、内存清理 | `manager.go:126-134`, `manager.go:512-544` |
@@ -191,9 +191,66 @@ func detectCapabilities(plugin functionExistsChecker) []Capability {
 - `users` - 用户信息访问
 - `websocket` - WebSocket 连接
 
-### 3.3 宿主调用前后的权限校验链路
+### 3.3 能力声明与权限联动约束（硬条件）
 
-#### 3.3.1 加载时权限校验（插件加载阶段）
+Navidrome 在加载时执行两轮 manifest 校验，确保能力与权限的一致性。
+
+#### 第一轮：Manifest 解析时校验（`manifest.go:27-43`）
+
+```go
+func (m *Manifest) Validate() error {
+    // 硬条件1: SubsonicAPI 权限 → 必须声明 Users 权限
+    if m.Permissions != nil && m.Permissions.Subsonicapi != nil {
+        if m.Permissions.Users == nil {
+            return fmt.Errorf("'subsonicapi' permission requires 'users' permission to be declared")
+        }
+    }
+    // 配置 schema 校验...
+    return nil
+}
+```
+
+#### 第二轮：能力检测后校验（`manifest.go:57-83`）
+
+```go
+func ValidateWithCapabilities(m *Manifest, capabilities []Capability) error {
+    // 硬条件2: Scrobbler 能力 → 必须声明 Users 权限
+    if hasCapability(capabilities, CapabilityScrobbler) {
+        if m.Permissions == nil || m.Permissions.Users == nil {
+            return fmt.Errorf("scrobbler capability requires 'users' permission to be declared in manifest")
+        }
+    }
+
+    // 硬条件3: Scheduler 权限 → 必须导出 SchedulerCallback 能力
+    if m.Permissions != nil && m.Permissions.Scheduler != nil {
+        if !hasCapability(capabilities, CapabilityScheduler) {
+            return fmt.Errorf("'scheduler' permission requires plugin to export '%s' function", FuncSchedulerCallback)
+        }
+    }
+
+    // 硬条件4: Taskqueue 权限 → 必须导出 TaskWorker 能力
+    if m.Permissions != nil && m.Permissions.Taskqueue != nil {
+        if !hasCapability(capabilities, CapabilityTaskWorker) {
+            return fmt.Errorf("'taskqueue' permission requires plugin to export '%s' function", FuncTaskWorkerCallback)
+        }
+    }
+
+    return nil
+}
+```
+
+#### 能力-权限联动矩阵
+
+| 能力/权限 | 硬约束关系 | 校验阶段 |
+|----------|-----------|---------|
+| **SubsonicAPI 权限** | → 必须声明 Users 权限 | Manifest 解析时 |
+| **Scrobbler 能力** | → 必须声明 Users 权限 | 能力检测后 |
+| **Scheduler 权限** | → 必须导出 `nd_scheduler_callback` | 能力检测后 |
+| **Taskqueue 权限** | → 必须导出 `nd_task_execute` | 能力检测后 |
+
+### 3.4 宿主调用前后的权限校验链路
+
+#### 3.4.1 加载时权限校验（插件加载阶段）
 
 **阶段一：宿主服务过滤** (`manager_loader.go:319-337`）
 
@@ -221,12 +278,12 @@ for _, entry := range hostServices {
 }
 ```
 
-**关键机制：
+**关键机制：**
 
 1.  只有在 manifest 中声明了对应权限的宿主服务才会被注册到插件实例中
-2.  未声明权限的服务，插件完全无法调用（WASM import 解析失败
+2.  未声明权限的服务，插件完全无法调用（WASM import 解析失败）
 
-#### 3.3.2 运行时权限校验（插件调用宿主函数阶段）
+#### 3.4.2 运行时权限校验（插件调用宿主函数阶段）
 
 每个宿主服务在实现层都有独立的权限校验逻辑：
 
@@ -358,15 +415,15 @@ func (s *taskQueueServiceImpl) clampConcurrency(ctx context.Context, name string
 }
 ```
 
-### 3.4 越权请求阻断机制
+### 3.5 越权请求阻断机制
 
 #### 阻断发生在三个层级：
 
 | 层级 | 阻断点 | 阻断方式 |
 |-----|--------|----------|
-| **加载时阻断** | `manager_loader.go:329-337` | 宿主函数不注册，插件无法 import 失败 |
+| **加载时阻断** | `manager_loader.go:329-337` | 宿主函数不注册，插件 WASM import 解析失败 |
 | **调用前阻断** | 各服务实现层 | 返回明确错误信息，调用失败 |
-| **结果过滤** | Users/Library 服务 | 过滤掉不允许的数据 |
+| **结果过滤** | Users/Library 服务 | 静默过滤掉不允许的数据 |
 
 #### 越权访问示例（Library 服务）：
 
@@ -407,7 +464,74 @@ isPrivateOrLoopback("192.168.1.1") → 返回 true（私有地址）
 
 ### 4.1 异常类型与处理机制
 
-#### 4.1.1 WASM Trap 异常
+#### 4.1.1 recover 与宿主函数错误返回的边界
+
+**关键澄清**：代码中**只有一个位置**有 panic recover 兜底，宿主函数执行时**没有** panic 捕获。
+
+| 场景 | 是否有 recover | 处理方式 |
+|-----|---------------|---------|
+| **插件加载阶段** (`manager_loader.go:201-206`) | ✅ 有 | goroutine 级别的 defer/recover，捕获加载过程中的 panic |
+| **宿主函数执行阶段** (`host/*_gen.go`) | ❌ 无 | 只有常规的错误检查（`if err != nil`），通过 JSON 返回错误 |
+| **插件 WASM 执行阶段** | - | Wazero 运行时捕获 trap，转换为 Go error |
+
+**加载阶段 recover 兜底** (`manager_loader.go:197-237`）
+
+```go
+g.Go(func() error {
+    start := time.Now()
+    log.Debug(ctx, "Loading enabled plugin", "plugin", plugin.ID, "path", plugin.Path)
+
+    // 唯一的 panic recover 兜底
+    defer func() {
+        if r := recover(); r != nil {
+            log.Error(ctx, "Panic while loading plugin", "plugin", plugin.ID, "panic", r)
+        }
+    }()
+
+    if err := m.loadPluginWithConfig(&plugin); err != nil {
+        plugin.LastError = err.Error()
+        plugin.Enabled = false
+        plugin.UpdatedAt = time.Now()
+        repo.Put(&plugin)
+        log.Error(ctx, "Failed to load plugin", "plugin", plugin.ID, err)
+        return nil
+    }
+    // ...
+    return nil
+})
+```
+
+**宿主函数错误处理（无 recover）** (`host/config_gen.go:54-83`）
+
+```go
+func newConfigGetHostFunction(service ConfigService) extism.HostFunction {
+    return extism.NewHostFunctionWithStack(
+        "config_get",
+        func(ctx context.Context, p *extism.CurrentPlugin, stack []uint64) {
+            // 只有常规错误检查，没有 recover
+            reqBytes, err := p.ReadBytes(stack[0])
+            if err != nil {
+                configWriteError(p, stack, err)
+                return
+            }
+            var req ConfigGetRequest
+            if err := json.Unmarshal(reqBytes, &req); err != nil {
+                configWriteError(p, stack, err)
+                return
+            }
+            // 调用业务服务
+            value, exists := service.Get(ctx, req.Key)
+            // 返回响应
+            resp := ConfigGetResponse{Value: value, Exists: exists}
+            configWriteResponse(p, stack, resp)
+        },
+    )
+}
+```
+
+> **重要风险提示**：宿主函数业务逻辑（如 `service.Get(ctx, req.Key)`）如果发生 panic，会直接崩溃整个宿主进程，因为没有 recover 兜底。这是当前设计的一个潜在风险点。
+
+#### 4.1.2 WASM Trap 异常
 
 WASM trap 是 WASM 运行时错误，包括：
 
@@ -432,41 +556,11 @@ if err != nil {
 }
 ```
 
-#### 4.1.2 插件 Panic 异常
+#### 4.1.3 插件 Panic 异常
 
-**加载阶段 Panic 捕获** (`manager_loader.go:201-206`）
+插件内部 panic 会被 WASM 运行时捕获为 trap，转换为 error 返回。
 
-```go
-g.Go(func() error {
-    defer func() {
-        if r := recover(); r != nil {
-            log.Error(ctx, "Panic while loading plugin", "plugin", plugin.ID, "panic", r)
-        }
-    }()
-    return m.loadPluginWithConfig(&plugin)
-})
-```
-
-**宿主函数执行 Panic 捕获** (`host/config_gen.go:54-83`）
-
-```go
-func newConfigGetHostFunction(service ConfigService) extism.HostFunction {
-    return extism.NewHostFunctionWithStack(
-        "config_get",
-        func(ctx context.Context, p *extism.CurrentPlugin, stack []uint64) {
-            // 所有错误被捕获并通过 JSON 返回
-            reqBytes, err := p.ReadBytes(stack[0])
-            if err != nil {
-                configWriteError(p, stack, err)
-                return
-            }
-            // ... 业务逻辑
-        },
-    )
-}
-```
-
-#### 4.1.3 超时异常
+#### 4.1.4 超时异常
 
 **默认超时**：30 秒（`manager.go:31`）
 
@@ -574,10 +668,10 @@ func (m *Manager) unloadPlugin(name string) error {
     // 1. 从注册表移除
     delete(m.plugins, name)
     
-    // 2. 执行 closers 清理（KVStore、Scheduler 等
+    // 2. 执行 closers 清理（KVStore、Scheduler 等）
     plugin.Close()
     
-    // 3. 关闭编译后的插件（带 5 秒宽限期
+    // 3. 关闭编译后的插件（带 5 秒宽限期）
     ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cancel()
     plugin.compiled.Close(ctx)
@@ -674,9 +768,9 @@ func (s *cacheServiceImpl) Close() error {
     │   │
     │   ├─ 正常执行 → 返回结果 → 销毁实例 → 成功
     │   │
-    │   ├─ WASM Trap → Extism 捕获 → 返回错误 → 销毁实例 → 下次调用重建
+    │   ├─ WASM Trap → Wazero 捕获 → 返回错误 → 销毁实例 → 下次调用重建
     │   │
-    │   ├─ 插件 Panic → Extism 捕获 → 返回错误 → 销毁实例 → 下次调用重建
+    │   ├─ 插件 Panic → WASM trap → 返回错误 → 销毁实例 → 下次调用重建
     │   │
     │   └─ 超时/取消 → context 取消 → 终止 WASM → 返回 DeadlineExceeded → 销毁实例 → 下次调用重建
     │
@@ -684,16 +778,257 @@ func (s *cacheServiceImpl) Close() error {
         │
         ├─ 权限校验失败 → 返回错误 → 插件侧处理
         │
-        └─ 宿主 Panic → 捕获并序列化为 JSON 错误 → 插件侧处理
+        ├─ 宿主 Panic → ⚠️ 无 recover → 可能崩溃宿主进程 ⚠️
         │
         └─ 宿主正常执行 → 返回结果
 ```
 
 ---
 
-## 五、跨语言调用约束
+## 五、插件启用前 Gate 与配置变更处理链路
 
-### 5.1 调用协议：JSON 序列化
+### 5.1 插件启用前 Gate 检查
+
+在插件启用前，系统会执行权限 Gate 检查，确保必要的配置已完成。
+
+**启用流程** (`manager.go:287-331`）
+
+```go
+func (m *Manager) EnablePlugin(ctx context.Context, id string) error {
+    // 1. 从数据库获取插件信息
+    plugin, err := repo.Get(id)
+    
+    // 2. 启用前 Gate 检查
+    if err := m.checkPermissionGates(plugin); err != nil {
+        return err  // Gate 不通过，拒绝启用
+    }
+    
+    // 3. 尝试加载插件
+    if err := m.loadPluginWithConfig(plugin); err != nil {
+        plugin.LastError = err.Error()
+        plugin.UpdatedAt = time.Now()
+        _ = repo.Put(plugin)
+        return fmt.Errorf("loading plugin: %w", err)
+    }
+    
+    // 4. 更新数据库状态
+    plugin.Enabled = true
+    plugin.LastError = ""
+    plugin.UpdatedAt = time.Now()
+    repo.Put(plugin)
+    
+    return nil
+}
+```
+
+**Gate 检查逻辑** (`manager.go:590-614`）
+
+```go
+func (m *Manager) checkPermissionGates(p *model.Plugin) error {
+    manifest, err := readManifest(p.Path)
+    
+    // Gate 1: Users 权限需要配置用户或 allUsers=true
+    if manifest.Permissions != nil && manifest.Permissions.Users != nil {
+        if !hasValidUsersConfig(p.Users, p.AllUsers) {
+            return fmt.Errorf("users permission requires configuration: select users or enable 'all users' access")
+        }
+    }
+    
+    // Gate 2: Library 权限需要配置库或 allLibraries=true
+    if manifest.Permissions != nil && manifest.Permissions.Library != nil {
+        if !hasValidLibrariesConfig(p.Libraries, p.AllLibraries) {
+            return fmt.Errorf("library permission requires configuration: select libraries or enable 'all libraries' access")
+        }
+    }
+    
+    return nil
+}
+```
+
+**配置有效性检查** (`manager.go:616-644`）
+
+```go
+func hasValidUsersConfig(usersJSON string, allUsers bool) bool {
+    if allUsers {
+        return true
+    }
+    if usersJSON == "" {
+        return false
+    }
+    var users []string
+    if err := json.Unmarshal([]byte(usersJSON), &users); err != nil {
+        return false
+    }
+    return len(users) > 0
+}
+
+func hasValidLibrariesConfig(librariesJSON string, allLibraries bool) bool {
+    if allLibraries {
+        return true
+    }
+    if librariesJSON == "" {
+        return false
+    }
+    var libraries []int
+    if err := json.Unmarshal([]byte(librariesJSON), &libraries); err != nil {
+        return false
+    }
+    return len(libraries) > 0
+}
+```
+
+### 5.2 配置变更后自动禁用与卸载链路
+
+当插件配置变更（如用户/库权限被移除）时，系统会自动检测并禁用不再满足权限条件的插件。
+
+**统一更新入口** (`manager.go:440-510`）
+
+```go
+func (m *Manager) updatePluginSettings(ctx context.Context, id string, updateFn func(*model.Plugin)) error {
+    plugin, err := repo.Get(id)
+    wasEnabled := plugin.Enabled
+    
+    // 1. 应用更新
+    updateFn(plugin)
+    plugin.UpdatedAt = time.Now()
+    
+    // 2. 检查权限是否仍然满足
+    shouldDisable := false
+    disableReason := ""
+    if wasEnabled {
+        manifest, err := readManifest(plugin.Path)
+        if err == nil && manifest.Permissions != nil {
+            // 检查 Users 权限是否仍然有效
+            if manifest.Permissions.Users != nil && !hasValidUsersConfig(plugin.Users, plugin.AllUsers) {
+                shouldDisable = true
+                disableReason = "users permission removal"
+            }
+            // 检查 Library 权限是否仍然有效
+            if manifest.Permissions.Library != nil && !hasValidLibrariesConfig(plugin.Libraries, plugin.AllLibraries) {
+                shouldDisable = true
+                disableReason = "library permission removal"
+            }
+        }
+    }
+    
+    // 3. 权限不满足 → 自动禁用
+    if shouldDisable {
+        m.unloadPlugin(id)
+        plugin.Enabled = false
+        repo.Put(plugin)
+        log.Info(ctx, "Disabled plugin due to "+disableReason, "plugin", id)
+        return nil
+    }
+    
+    // 4. 保存配置
+    repo.Put(plugin)
+    
+    // 5. 如果之前是启用状态 → 重新加载
+    if wasEnabled {
+        m.unloadPlugin(id)
+        if err := m.loadPluginWithConfig(plugin); err != nil {
+            plugin.LastError = err.Error()
+            plugin.Enabled = false
+            repo.Put(plugin)
+            return fmt.Errorf("reloading plugin: %w", err)
+        }
+    }
+    
+    return nil
+}
+```
+
+### 5.3 用户/库删除后的清理链路
+
+当用户或媒体库被删除时，系统会清理相关插件的权限。
+
+**清理禁用插件** (`manager.go:546-588`）
+
+```go
+func (m *Manager) UnloadDisabledPlugins(ctx context.Context) {
+    // 1. 获取所有被禁用的插件
+    plugins, err := repo.GetAll(model.QueryOptions{
+        Filters: squirrel.Eq{"enabled": false},
+    })
+    
+    // 2. 检查每个被禁用的插件是否仍在内存中
+    var unloaded []string
+    for _, p := range plugins {
+        m.mu.RLock()
+        _, loaded := m.plugins[p.ID]
+        m.mu.RUnlock()
+        
+        if loaded {
+            // 3. 卸载仍在内存中的插件
+            if err := m.unloadPlugin(p.ID); err != nil {
+                log.Debug(ctx, "Plugin was not loaded", "plugin", p.ID)
+            }
+            unloaded = append(unloaded, p.ID)
+        }
+    }
+    
+    // 4. 发送刷新事件
+    if len(unloaded) > 0 {
+        m.sendPluginRefreshEvent(ctx, unloaded...)
+    }
+}
+```
+
+### 5.4 完整生命周期链路图
+
+```
+用户启用插件
+    │
+    ▼
+EnablePlugin()
+    │
+    ├─ checkPermissionGates()
+    │   ├─ 检查 Users 权限配置
+    │   └─ 检查 Library 权限配置
+    │
+    ├─ loadPluginWithConfig()
+    │   ├─ 解析 manifest
+    │   ├─ Validate() → 检查 SubsonicAPI→Users 依赖
+    │   ├─ 编译 WASM
+    │   ├─ detectCapabilities() → 检测导出函数
+    │   └─ ValidateWithCapabilities() → 检查能力-权限联动
+    │       ├─ Scrobbler → Users 权限
+    │       ├─ Scheduler → SchedulerCallback 能力
+    │       └─ Taskqueue → TaskWorker 能力
+    │
+    └─ 更新 DB: Enabled=true
+
+
+用户/库被删除
+    │
+    ▼
+触发 UnloadDisabledPlugins()
+    │
+    ├─ 查询 DB 中 Enabled=false 的插件
+    ├─ 检查这些插件是否仍在内存中
+    └─ 卸载内存中的插件 → unloadPlugin()
+
+
+配置变更
+    │
+    ▼
+updatePluginSettings()
+    │
+    ├─ 应用配置更新
+    ├─ 检查权限是否仍然满足
+    │   ├─ Users 权限是否还有效
+    │   └─ Library 权限是否还有效
+    │
+    ├─ 权限不满足 → 自动禁用 + 卸载
+    │
+    └─ 权限满足 → 重新加载插件
+```
+
+---
+
+## 六、跨语言调用约束
+
+### 6.1 调用协议：JSON 序列化
 
 宿主与插件之间的所有交互统一使用 **JSON** 作为序列化格式，确保跨语言兼容性。
 
@@ -728,7 +1063,7 @@ func ConfigGet(key string) (string, bool) {
 }
 ```
 
-### 5.2 宿主函数注册机制
+### 6.2 宿主函数注册机制
 
 宿主函数通过代码生成器 `ndpgen` 从 Go 接口定义自动生成。
 
@@ -754,7 +1089,7 @@ func RegisterConfigHostFunctions(service ConfigService) []extism.HostFunction {
 }
 ```
 
-### 5.3 未实现函数的优雅处理
+### 6.3 未实现函数的优雅处理
 
 插件无需实现能力的所有方法，通过约定的返回码 `0xFFFFFFFE` 标识未实现：
 
@@ -786,9 +1121,9 @@ func _NdOnInit() int32 {
 
 ---
 
-## 六、代码生成与多语言支持
+## 七、代码生成与多语言支持
 
-### 6.1 ndpgen 工具链
+### 7.1 ndpgen 工具链
 
 `ndpgen` 是 Navidrome 自研的 PDK 代码生成器，从 Go 接口定义生成多语言绑定：
 
@@ -812,7 +1147,7 @@ Go 接口定义 (//nd:hostservice, //nd:capability)
 - `GenerateCapabilityGo/Python/Rust` - 能力接口包装
 - `GeneratePDKGo` - 核心 PDK 包装
 
-### 6.2 插件开发示例
+### 7.2 插件开发示例
 
 ```go
 // examples/minimal/main.go
@@ -845,18 +1180,39 @@ tinygo build -o minimal.wasm -target wasip1 -buildmode=c-shared .
 
 ---
 
-## 七、总结
+## 八、总结与设计评估
 
-Navidrome 插件体系设计体现了清晰的职责分离与健壮的隔离机制：
+### 8.1 设计亮点
 
-1. **宿主职责**：聚焦于运行时管理、安全控制、资源隔离，通过声明式权限模型精确控制插件能力边界
+1. **清晰的职责分离**：宿主聚焦运行时管理与安全控制，PDK 提供类型安全的跨语言抽象
 
-2. **PDK 职责**：提供类型安全的跨语言抽象，封装底层 WASM 交互细节，让开发者专注于业务逻辑
+2. **三层权限防护**：加载时过滤 → 调用前校验 → 调用后过滤，确保最小权限原则
 
-3. **权限校验链路**：从加载时过滤 → 调用前校验 → 调用后过滤，三层防护
+3. **能力-权限硬约束**：通过 `Validate()` 和 `ValidateWithCapabilities()` 两轮校验，确保能力与权限一致性
 
-4. **异常恢复路径**：实例级隔离、自动重试、持久化状态恢复，构建完整容错体系
+4. **实例级隔离**：每次调用创建新 WASM 实例，故障影响范围最小化
 
-5. **故障隔离**：从 WASM 内存沙箱、超时控制、Panic 恢复到故障降级，构建了完整的容错体系
+5. **完整的资源清理**：通过 `closers` 模式统一管理 KVStore、Scheduler、WebSocket 等资源
 
-这种设计既保证了插件的灵活性与可扩展性，又通过多层次的安全与隔离机制，有效控制了插件引入的风险，是生产级插件系统的优秀实践。
+6. **配置变更自动处理**：用户/库删除或权限变更时自动禁用插件，防止越权访问
+
+### 8.2 潜在风险与改进建议
+
+| 风险点 | 严重程度 | 建议 |
+|-------|---------|------|
+| **宿主函数无 panic 兜底** | 高 | 在 `ndpgen` 生成的宿主函数包装中添加 defer/recover，防止业务逻辑 panic 崩溃宿主 |
+| **加载时 recover 范围过大** | 中 | recover 只捕获了加载 goroutine，但 `loadPluginWithConfig` 内部的错误通过 error 返回，逻辑一致但设计稍显冗余 |
+| **无插件调用熔断机制** | 中 | 可考虑添加失败率阈值，连续失败多次后自动熔断插件 |
+| **无插件资源使用监控** | 低 | 可考虑添加 WASM 内存使用、CPU 时间的监控与限制 |
+
+### 8.3 关键设计决策汇总
+
+| 决策点 | 选择 | 理由 |
+|-------|------|------|
+| **序列化协议** | JSON | 跨语言兼容性最好，调试友好 |
+| **实例模型** | 每次调用新建实例 | 最大化隔离，简化错误恢复 |
+| **权限模型** | manifest 声明 + 运行时校验 | 声明式配置 + 纵深防御 |
+| **能力检测** | 扫描 WASM 导出函数 | 无需额外声明，自动发现 |
+| **多语言支持** | 代码生成器 ndpgen | 从单一 Go 定义生成多语言绑定，确保一致性 |
+
+Navidrome 插件体系通过多层次的安全与隔离机制，在保证插件灵活性的同时有效控制了风险，是生产级插件系统的优秀实践。
