@@ -62,15 +62,17 @@ type Claims struct {
 
 ## 3. 登录用户认证流程
 
+Navidrome 有两条独立的登录用户认证路径，**各自实现过期检查**，过期判断并非集中在 `Authenticator` 一处完成。
+
 ### 3.1 Native API 认证链
 
 **路由配置**: `server/nativeapi/native_api.go:63-95`
 
 ```
-请求 → JWTVerifier → Authenticator → JWTRefresher → UpdateLastAccessMiddleware → 业务处理器
+请求 → [全局中间件] JWTVerifier → [路由组中间件] Authenticator → JWTRefresher → UpdateLastAccessMiddleware → 业务处理器
 ```
 
-#### 阶段 1: JWTVerifier (`server/auth.go:174-176`)
+#### 阶段 1: JWTVerifier（全局中间件，`server/auth.go:174-176`）
 
 ```go
 func JWTVerifier(next http.Handler) http.Handler {
@@ -82,17 +84,13 @@ func JWTVerifier(next http.Handler) http.Handler {
 }
 ```
 
-**令牌提取优先级**:
-1. 自定义请求头 `X-ND-Authorization`
-2. Cookie
-3. 查询参数
+**职责边界**：
+- 从请求头、Cookie、查询参数提取令牌
+- 验证令牌签名，将解析后的令牌存入上下文
+- **不检查过期**（jwtauth 库会检测但不拒绝，仅将错误存入上下文）
+- 无令牌或验证失败的请求继续执行，不终止请求链
 
-> **关键边界**: `JWTVerifier` 是**全局可选验证中间件**，仅做两件事：
-> - 如找到令牌则验证签名，并将解析后的令牌存入请求上下文
-> - 如验证失败（签名错误、过期等），将错误存入上下文，但**不会终止请求链**
-> - 无令牌的请求会直接通过，不做任何处理
-
-#### 阶段 2: Authenticator (`server/auth.go:260-272`)
+#### 阶段 2: Authenticator（Native API 专属，`server/auth.go:260-272`）
 
 ```go
 func Authenticator(ds model.DataStore) func(next http.Handler) http.Handler {
@@ -103,32 +101,48 @@ func Authenticator(ds model.DataStore) func(next http.Handler) http.Handler {
                 UsernameFromToken,        // 从 JWT 提取
                 UsernameFromExtAuthHeader // 反向代理认证
             )
-            // ... 错误处理
+            if err != nil {
+                _ = rest.RespondWithError(w, http.StatusUnauthorized, "Not authenticated")
+                return
+            }
             next.ServeHTTP(w, r.WithContext(ctx))
         })
     }
 }
 ```
 
-**认证来源优先级**:
-1. 配置自动登录（开发环境）
-2. JWT 令牌
-3. 外部认证头（需配置可信代理）
+**过期检查点**：`UsernameFromToken()` → `jwtauth.FromContext()`
 
-> **关键边界**: `Authenticator` 是**强制认证中间件**，是实际执行令牌有效性检查的地方：
-> - 通过 `UsernameFromToken()` 调用 `jwtauth.FromContext()` 获取令牌
-> - 如令牌已过期或无效，`FromContext()` 返回错误 → `UsernameFromToken()` 返回空字符串
-> - 如无法获取有效用户名，`authenticateRequest()` 返回 `ErrUnauthenticated` → 返回 401
-> - **会话令牌的过期检查实际发生在这里**
+```go
+func UsernameFromToken(r *http.Request) string {
+    token, _, err := jwtauth.FromContext(r.Context())
+    if err != nil || token == nil {
+        return ""  // 令牌过期或无效，返回空字符串
+    }
+    sub, _ := token.Subject()
+    return sub
+}
+```
 
-#### 阶段 3: JWTRefresher (`server/auth.go:275-293`)
+**关键边界**：
+- 这是 **Native API 的过期检查点**
+- 如令牌已过期，`jwtauth.FromContext()` 返回错误 → `UsernameFromToken()` 返回空
+- 无法获取有效用户名 → `authenticateRequest()` 返回 `ErrUnauthenticated` → 返回 401
+- 此中间件**仅用于 Native API**，Subsonic API 不使用它
+
+#### 阶段 3: JWTRefresher（Native API 专属，`server/auth.go:275-293`）
 
 ```go
 func JWTRefresher(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        ctx := r.Context()
         token, _, err := jwtauth.FromContext(ctx)
+        if err != nil {
+            next.ServeHTTP(w, r)  // 令牌有问题直接跳过
+            return
+        }
+        newTokenString, err := auth.TouchToken(token)  // 延长过期时间
         if err == nil {
-            newTokenString, _ := auth.TouchToken(token)
             w.Header().Set(consts.UIAuthorizationHeader, newTokenString)
         }
         next.ServeHTTP(w, r)
@@ -136,23 +150,116 @@ func JWTRefresher(next http.Handler) http.Handler {
 }
 ```
 
-**滑动会话机制**:
-- 每次有效请求都会更新 `ExpiresAt`
+**滑动会话机制**：
+- 仅当令牌有效（未过期）时才刷新
 - 新令牌通过响应头 `X-ND-Authorization` 返回
 - 会话超时：默认 48 小时（`DefaultSessionTimeout`）
 
-### 3.2 Subsonic API 认证
+---
 
-**核心文件**: `server/subsonic/middlewares.go:100-156`
+### 3.2 Subsonic API 认证链
 
-Subsonic API 支持四种认证方式：
+**路由配置**: `server/subsonic/api.go:98-233`
 
-| 方式 | 参数 | 说明 |
-|------|------|------|
-| 明文密码 | `u` + `p` | `p` 支持 `enc:` 前缀的十六进制编码 |
-| 令牌认证 | `u` + `t` + `s` | `t = md5(password + s)` |
-| JWT 认证 | `u` + `jwt` | 复用 Navidrome 会话令牌 |
-| 内部/代理 | 头信息 | 插件调用或反向代理 |
+```
+请求 → [全局中间件] JWTVerifier → [路由组中间件] checkRequiredParameters → authenticate(Subsonic专属) → UpdateLastAccessMiddleware → 业务处理器
+```
+
+> **重要**：Subsonic API **不使用** Native API 的 `Authenticator` 和 `JWTRefresher`，它有自己独立的认证中间件。
+
+#### 阶段 1: authenticate（Subsonic 专属，`server/subsonic/middlewares.go:100-156`）
+
+Subsonic 的 `authenticate` 中间件有**两个独立分支**，过期检查逻辑不同：
+
+##### 分支 A：内部/反向代理认证（`server/subsonic/middlewares.go:108-120`）
+
+```go
+username, isInternalAuth := fromInternalOrProxyAuth(r)
+if username != "" {
+    usr, err = ds.User(ctx).FindByUsername(username)
+    // 只检查用户是否存在，不检查 JWT 过期
+}
+```
+
+**过期检查**：❌ 无过期检查
+- 内部认证（插件调用）和反向代理认证直接信任用户名
+- 不涉及 JWT 令牌，因此不检查过期
+
+##### 分支 B：Subsonic 标准认证（`server/subsonic/middlewares.go:121-145`）
+
+```go
+p := req.Params(r)
+username, _ := p.String("u")
+pass, _ := p.String("p")
+token, _ := p.String("t")
+salt, _ := p.String("s")
+jwt, _ := p.String("jwt")
+
+usr, err = ds.User(ctx).FindByUsernameWithPassword(username)
+if err == nil {
+    err = validateCredentials(usr, pass, token, salt, jwt)  // 验证凭证
+}
+```
+
+#### 阶段 2: validateCredentials（JWT 过期检查点，`server/subsonic/middlewares.go:158-181`）
+
+```go
+func validateCredentials(user *model.User, pass, token, salt, jwt string) error {
+    valid := false
+    switch {
+    case jwt != "":
+        // Subsonic JWT 认证的过期检查点
+        claims, err := auth.Validate(jwt)  // ✅ 这里检查过期！
+        valid = err == nil && claims.Subject == user.UserName
+    case pass != "":
+        // 密码认证，无过期检查
+        valid = pass == user.Password
+    case token != "":
+        // MD5 令牌认证，无过期检查
+        t := fmt.Sprintf("%x", md5.Sum([]byte(user.Password+salt)))
+        valid = t == token
+    }
+    if !valid {
+        return model.ErrInvalidAuth
+    }
+    return nil
+}
+```
+
+**过期检查点**：`auth.Validate(jwt)` → `jwtauth.VerifyToken()`
+
+```go
+// core/auth/auth.go:86-92
+func Validate(tokenStr string) (Claims, error) {
+    token, err := jwtauth.VerifyToken(TokenAuth, tokenStr)  // 验证签名+过期
+    if err != nil {
+        return Claims{}, err
+    }
+    return ClaimsFromToken(token), nil
+}
+```
+
+**关键边界**：
+- 这是 **Subsonic API 的 JWT 过期检查点**
+- `auth.Validate()` 会完整验证 JWT 的签名和过期时间
+- 如令牌过期，返回错误 → `validateCredentials` 失败 → 返回 Subsonic 认证错误（代码 40）
+- 密码认证（`p` 参数）和 MD5 令牌认证（`t`/`s` 参数）**不检查过期**，只要密码正确即可通过
+
+---
+
+### 3.3 两条认证路径对比
+
+| 特性 | Native API | Subsonic API |
+|------|-----------|-------------|
+| 认证中间件 | `Authenticator`（`server/auth.go`） | `authenticate`（`server/subsonic/middlewares.go`） |
+| JWT 过期检查点 | `UsernameFromToken()` → `jwtauth.FromContext()` | `validateCredentials()` → `auth.Validate(jwt)` |
+| 密码认证过期检查 | ❌ 不支持密码认证 | ❌ 密码认证不检查过期 |
+| MD5 令牌认证 | ❌ 不支持 | ❌ 不检查过期 |
+| 滑动会话刷新 | ✅ `JWTRefresher` 自动刷新 | ❌ 无令牌刷新机制 |
+| 过期后 HTTP 状态 | 401 Unauthorized | 200 OK（Subsonic 错误码 40） |
+| 全局 `JWTVerifier` 作用 | 预解析令牌，存入上下文 | 预解析令牌，但 Subsonic 不使用上下文的令牌，而是重新从 `jwt` 参数解析 |
+
+> **重要结论**：过期检查**不是集中在 `Authenticator` 一处完成**。Native API 和 Subsonic API 各自有独立的过期检查实现，检查位置和方式完全不同。
 
 ---
 
@@ -487,17 +594,38 @@ func encodeMediafileShare(s model.Share, id string) string {
 
 ## 7. 令牌过期与撤销边界
 
-### 7.1 过期机制
+### 7.1 过期机制（按访问路径分类）
+
+#### Native API 路径
 
 | 令牌类型 | 过期检查点 | 过期后行为 |
 |---------|-----------|-----------|
-| 会话令牌 | `Authenticator` → `UsernameFromToken` → `jwtauth.FromContext()` | 返回 401 Unauthorized |
-| 分享流令牌 | `auth.Validate()` + 分享记录检查 | 返回 400 Bad Request 或 410 Gone |
-| 分享页面 | `share.Load()` 中检查 | 返回 410 Gone |
-| 转码令牌 | `parseTranscodeParams()` | 返回错误，需要重新获取 |
-| 公开图片 | **不检查过期** | 永久可访问（只要签名有效） |
+| 会话令牌（JWT） | `Authenticator` → `UsernameFromToken` → `jwtauth.FromContext()` | 返回 401 Unauthorized |
 
-> **重要澄清**: 会话令牌的过期检查**不发生在 `JWTVerifier`**。`JWTVerifier` 仅将过期错误存入上下文但不拒绝请求；真正的过期检查发生在 `Authenticator` 中间件调用 `UsernameFromToken` 时。
+#### Subsonic API 路径
+
+| 认证方式 | 过期检查点 | 过期后行为 |
+|---------|-----------|-----------|
+| JWT 认证（`jwt` 参数） | `validateCredentials()` → `auth.Validate(jwt)` | 返回 200 OK + Subsonic 错误码 40 |
+| 密码认证（`p` 参数） | ❌ 无过期检查 | 只要密码正确就通过 |
+| MD5 令牌认证（`t`/`s` 参数） | ❌ 无过期检查 | 只要哈希匹配就通过 |
+| 内部/反向代理认证 | ❌ 无过期检查 | 直接信任用户名 |
+
+#### 公开路由路径
+
+| 令牌类型 | 过期检查点 | 过期后行为 |
+|---------|-----------|-----------|
+| 分享流令牌 | `auth.Validate()` + 分享记录检查 | 返回 400 Bad Request 或 410 Gone |
+| 分享页面 | `share.Load()` 中检查 `ExpiresAt` | 返回 410 Gone |
+| 转码令牌 | `parseTranscodeParams()` | 返回错误，需要重新获取 |
+| 公开图片 | ❌ 不检查过期 | 永久可访问（只要签名有效） |
+
+> **重要澄清**:
+> 1. 会话令牌的过期检查**不发生在 `JWTVerifier`**。`JWTVerifier` 仅将过期错误存入上下文但不拒绝请求
+> 2. 过期检查**不是集中在 `Authenticator` 一处完成**：
+>    - Native API: `Authenticator` → `UsernameFromToken`
+>    - Subsonic API: `authenticate` → `validateCredentials` → `auth.Validate(jwt)`
+>    - 公开路由: 各处理器自行调用 `auth.Validate()` 或检查分享记录
 
 ### 7.2 撤销机制
 
@@ -590,18 +718,100 @@ if info.shareID != "" {
 
 > **统一结论**: `/share/d/{id}` 路由的**挂载前提**是 `EnableSharing && EnableDownloads` 同时为 `true`。即使路由挂载，下载请求仍需通过 `share.Downloadable` 的业务层检查。
 
-### 10.2 会话令牌过期检查边界
+### 10.2 三条访问路径的过期检查边界
 
-**代码依据**: `server/auth.go:174-176`, `server/auth.go:260-272`, `server/auth.go:187-198`
+#### 10.2.1 全局中间件 JWTVerifier 的职责
 
-| 中间件 | 职责 | 是否检查过期 | 是否拒绝请求 |
-|-------|------|-------------|-------------|
-| `JWTVerifier` | 全局可选验证：解析令牌、验证签名、将令牌/错误存入上下文 | ⚠️ jwtauth 库内部会检测过期，但仅将错误存入上下文 | ❌ 不拒绝，请求继续执行 |
-| `Authenticator` | 强制认证：通过 `UsernameFromToken` 尝试获取有效用户名 | ✅ 间接检查：如令牌过期，`jwtauth.FromContext()` 返回错误 → 无有效用户名 | ✅ 返回 401 Unauthorized |
+**代码依据**: `server/auth.go:174-176`
 
-> **统一结论**: 会话令牌的过期检查**发生在 `Authenticator` 中间件**，而非 `JWTVerifier`。`JWTVerifier` 仅验证签名并传递结果，不做访问控制决策。
+| 职责 | 是否执行 | 说明 |
+|------|---------|------|
+| 提取令牌 | ✅ | 从请求头、Cookie、查询参数提取 |
+| 验证签名 | ✅ | 验证 JWT 签名有效性 |
+| 检查过期 | ⚠️ | jwtauth 库内部检测，但仅将错误存入上下文，**不拒绝请求** |
+| 无令牌处理 | ✅ | 直接通过，不做任何处理 |
 
-### 10.3 公开路由与全局中间件关系
+> **结论**: `JWTVerifier` 是**全局可选验证中间件**，不做访问控制决策，仅为后续中间件预解析令牌。
+
+---
+
+#### 10.2.2 Native API 路径
+
+**代码依据**: `server/auth.go:260-272`, `server/auth.go:187-198`
+
+```
+JWTVerifier（预解析）→ Authenticator（过期检查）→ JWTRefresher（刷新令牌）→ 业务处理器
+```
+
+| 中间件 | 职责 | 过期检查方式 | 拒绝条件 |
+|-------|------|-------------|---------|
+| `Authenticator` | 强制认证 | `UsernameFromToken()` → `jwtauth.FromContext()` | 令牌过期或无效 → 返回 401 |
+| `JWTRefresher` | 滑动会话 | 仅对有效令牌刷新过期时间 | 令牌过期则跳过刷新 |
+
+> **结论**: Native API 的过期检查发生在 `Authenticator` 中间件，通过 `jwtauth.FromContext()` 间接检测过期。
+
+---
+
+#### 10.2.3 Subsonic API 路径
+
+**代码依据**: `server/subsonic/middlewares.go:100-181`
+
+```
+JWTVerifier（预解析但不使用）→ checkRequiredParameters → authenticate（分支处理）→ 业务处理器
+```
+
+Subsonic API **不使用** `Authenticator`，有自己独立的认证逻辑，分两个分支：
+
+##### 分支 A：内部/反向代理认证
+- 无 JWT 令牌，直接信任用户名
+- ❌ **无过期检查**
+
+##### 分支 B：Subsonic 标准认证
+- 进一步分为三种凭证验证方式：
+
+| 认证方式 | 过期检查点 | 拒绝条件 |
+|---------|-----------|---------|
+| JWT 认证（`jwt` 参数） | `validateCredentials()` → `auth.Validate(jwt)` | 令牌过期或用户名不匹配 → Subsonic 错误码 40 |
+| 密码认证（`p` 参数） | ❌ 无过期检查 | 密码错误 → Subsonic 错误码 40 |
+| MD5 令牌认证（`t`/`s`） | ❌ 无过期检查 | 哈希不匹配 → Subsonic 错误码 40 |
+
+> **重要**: Subsonic API 会**重新从 `jwt` 查询参数解析令牌**，不使用全局 `JWTVerifier` 存入上下文的令牌。
+
+---
+
+#### 10.2.4 公开路由路径
+
+**代码依据**: `server/public/handle_streams.go:84`, `server/public/handle_shares.go`
+
+```
+JWTVerifier（预解析但不使用）→ URLParamsMiddleware → 各处理器自行验证
+```
+
+公开路由没有统一的认证中间件，各处理器自行验证：
+
+| 处理器 | 过期检查方式 | 拒绝条件 |
+|-------|-------------|---------|
+| 分享流（`/s/{id}`） | `auth.Validate(tokenString)` | 令牌过期 → 400 Bad Request |
+| 分享页面（`/{id}`） | `share.Load()` 检查 `ExpiresAt` | 分享过期 → 410 Gone |
+| 转码流 | `parseTranscodeParams()` | 令牌过期 → 返回错误 |
+| 公开图片（`/img/{id}`） | ❌ 不检查过期 | 只要签名有效就永久可访问 |
+
+---
+
+### 10.3 过期检查点汇总（全路径）
+
+| 访问路径 | 认证方式 | 过期检查点 | 过期后 HTTP 状态 |
+|---------|---------|-----------|-----------------|
+| Native API | JWT | `Authenticator` → `UsernameFromToken` | 401 Unauthorized |
+| Subsonic API | JWT | `authenticate` → `validateCredentials` → `auth.Validate` | 200 OK（错误码 40） |
+| Subsonic API | 密码/MD5 | ❌ 无过期检查 | N/A |
+| 公开分享流 | JWT | `handleStream` → `auth.Validate` | 400 Bad Request |
+| 公开分享页面 | 分享记录 | `handleShares` → `share.Load` | 410 Gone |
+| 公开图片 | 仅签名 | ❌ 不检查过期 | N/A |
+
+> **核心结论**: 过期检查**不是集中在 `Authenticator` 一处完成**。Navidrome 至少有 5 个独立的过期检查点，分布在不同的代码路径中。
+
+### 10.4 公开路由与全局中间件关系
 
 **代码依据**: `server/server.go:148-185`, `server/public/public.go:38-60`
 
@@ -612,7 +822,7 @@ if info.shareID != "" {
 
 > **统一结论**: 公开路由经过完整的全局中间件链，因此公开请求上下文中包含 `RequestID`、`RealIP`、`ClientUniqueId` 等字段。但公开路由不经过认证中间件，因此不强制用户登录。
 
-### 10.4 公开请求中 ClientUniqueId 的真实来源
+### 10.5 公开请求中 ClientUniqueId 的真实来源
 
 **代码依据**: `server/middlewares.go:92-118`
 
