@@ -1,4 +1,4 @@
-﻿# Navidrome 认证机制与公开访问路径分析报告
+# Navidrome 认证机制与公开访问路径分析报告
 
 ## 1. 架构概览
 
@@ -18,7 +18,7 @@ Navidrome 采用 **JWT (JSON Web Token)** 作为核心认证机制，同时支�
 
 **核心文件**: `core/auth/auth.go:26-46`
 
-`````go
+```go
 func Init(ds model.DataStore) {
     once.Do(func() {
         secret, err := ds.Property(ctx).Get(consts.JWTSecretKey)
@@ -40,7 +40,7 @@ func Init(ds model.DataStore) {
 
 **核心文件**: `core/auth/claims.go:9-104`
 
-`````go
+```go
 type Claims struct {
     // 标准 JWT 声明
     Issuer    string    // iss
@@ -70,9 +70,9 @@ type Claims struct {
 请求 → JWTVerifier → Authenticator → JWTRefresher → UpdateLastAccessMiddleware → 业务处理器
 ```
 
-#### 阶段 1: JWTVerifier (``server/auth.go:174-176``)
+#### 阶段 1: JWTVerifier (`server/auth.go:174-176`)
 
-`````go
+```go
 func JWTVerifier(next http.Handler) http.Handler {
     return jwtauth.Verify(auth.TokenAuth, 
         tokenFromHeader,        // X-ND-Authorization: Bearer <token>
@@ -87,9 +87,14 @@ func JWTVerifier(next http.Handler) http.Handler {
 2. Cookie
 3. 查询参数
 
+> **关键边界**: `JWTVerifier` 是**全局可选验证中间件**，仅做两件事：
+> - 如找到令牌则验证签名，并将解析后的令牌存入请求上下文
+> - 如验证失败（签名错误、过期等），将错误存入上下文，但**不会终止请求链**
+> - 无令牌的请求会直接通过，不做任何处理
+
 #### 阶段 2: Authenticator (`server/auth.go:260-272`)
 
-`````go
+```go
 func Authenticator(ds model.DataStore) func(next http.Handler) http.Handler {
     return func(next http.Handler) http.Handler {
         return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -110,9 +115,15 @@ func Authenticator(ds model.DataStore) func(next http.Handler) http.Handler {
 2. JWT 令牌
 3. 外部认证头（需配置可信代理）
 
+> **关键边界**: `Authenticator` 是**强制认证中间件**，是实际执行令牌有效性检查的地方：
+> - 通过 `UsernameFromToken()` 调用 `jwtauth.FromContext()` 获取令牌
+> - 如令牌已过期或无效，`FromContext()` 返回错误 → `UsernameFromToken()` 返回空字符串
+> - 如无法获取有效用户名，`authenticateRequest()` 返回 `ErrUnauthenticated` → 返回 401
+> - **会话令牌的过期检查实际发生在这里**
+
 #### 阶段 3: JWTRefresher (`server/auth.go:275-293`)
 
-`````go
+```go
 func JWTRefresher(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         token, _, err := jwtauth.FromContext(ctx)
@@ -151,30 +162,42 @@ Subsonic API 支持四种认证方式：
 
 **核心文件**: `server/public/public.go:38-60`
 
-`````go
+```go
 func (pub *Router) routes() http.Handler {
     r := chi.NewRouter()
     r.Group(func(r chi.Router) {
         r.Use(server.URLParamsMiddleware)
-        r.HandleFunc("/img/{id}", pub.handleImages)    // 公开图片
+        
+        // 图片接口不受 EnableSharing 控制，始终可用
+        r.Group(func(r chi.Router) {
+            r.Use(server.ThrottleBacklog(...))
+            r.HandleFunc("/img/{id}", pub.handleImages)
+        })
+        
+        // 以下接口受 EnableSharing 控制
         if conf.Server.EnableSharing {
-            r.HandleFunc("/s/{id}", pub.handleStream)  // 公开流媒体
-            r.HandleFunc("/d/{id}", pub.handleDownloads) // 公开下载
-            r.HandleFunc("/{id}/m3u", pub.handleM3U)   // M3U 播放列表
-            r.HandleFunc("/{id}", pub.handleShares)    // 分享页面
+            r.HandleFunc("/s/{id}", pub.handleStream)
+            // 下载接口同时受 EnableSharing 和 EnableDownloads 控制
+            if conf.Server.EnableDownloads {
+                r.HandleFunc("/d/{id}", pub.handleDownloads)
+            }
+            r.HandleFunc("/{id}/m3u", pub.handleM3U)
+            r.HandleFunc("/{id}", pub.handleShares)
+            r.HandleFunc("/", pub.handleShares)
+            r.Handle("/*", pub.assetsHandler)
         }
     })
     return r
 }
 ```
 
-> **重要**: 公开路由 **不经过** `Authenticator` 和 `JWTRefresher` 中间件，也不调用 `UpdateLastAccessMiddleware`。
+> **重要**: 公开路由 **不经过** `Authenticator`、`JWTRefresher` 和 `UpdateLastAccessMiddleware`，但会经过全局中间件链。
 
 ### 4.2 全局中间件应用分析
 
 **路由挂载机制**: `server/server.go:51-57`
 
-`````go
+```go
 func (s *Server) MountRouter(description, urlPath string, subRouter http.Handler) {
     urlPath = path.Join(conf.Server.BasePath, urlPath)
     log.Info(fmt.Sprintf("Mounting %s routes", description), "path", urlPath)
@@ -185,7 +208,7 @@ func (s *Server) MountRouter(description, urlPath string, subRouter http.Handler
 ```
 
 **全局中间件链** (`server/server.go:172-185`):
-`````go
+```go
 defaultMiddlewares := chi.Middlewares{
     secureMiddleware(),           // 安全头
     corsHandler(),                // CORS 配置
@@ -206,13 +229,15 @@ defaultMiddlewares := chi.Middlewares{
 - ✅ **所有公开路由都经过全局中间件链**，包括 `JWTVerifier`
 - ✅ 公开请求会被分配 RequestID、记录日志、解析真实 IP
 - ✅ 公开请求支持 CORS，响应会被压缩
+- ✅ `clientUniqueIDMiddleware` 会为公开请求设置 `ClientUniqueId`（从 `X-ND-Client-Unique-Id` 头或 Cookie）
 - ❌ 但公开路由**不会**在 `Authenticator` 中验证用户身份
-- ❌ `JWTVerifier` 仅验证签名，不强制要求令牌存在（无令牌的请求继续执行）
+- ❌ `JWTVerifier` 是可选验证，不强制要求令牌存在（无令牌的请求继续执行）
+- ❌ 公开路由不会经过 `JWTRefresher` 和 `UpdateLastAccessMiddleware`
 
 ### 4.3 公开下载路径配置分析
 
 **路由注册**: `server/public/public.go:50-52`
-`````go
+```go
 if conf.Server.EnableSharing {
     r.HandleFunc("/s/{id}", pub.handleStream)
     if conf.Server.EnableDownloads {
@@ -233,7 +258,7 @@ if conf.Server.EnableSharing {
 | `true` | `true` | `true` | ✅ 完全可用 |
 
 **下载权限检查**: `core/archiver.go:94-104`
-`````go
+```go
 func (a *archiver) ZipShare(ctx context.Context, id string, out io.Writer) error {
     s, err := a.shares.Load(ctx, id)  // 检查分享是否存在且未过期
     if err != nil {
@@ -247,7 +272,7 @@ func (a *archiver) ZipShare(ctx context.Context, id string, out io.Writer) error
 ```
 
 **错误处理**: `server/public/handle_shares.go:66-81`
-`````go
+```go
 func checkShareError(ctx context.Context, w http.ResponseWriter, err error, id string) {
     switch {
     case errors.Is(err, model.ErrNotAuthorized):
@@ -262,7 +287,7 @@ func checkShareError(ctx context.Context, w http.ResponseWriter, err error, id s
 
 **核心文件**: `server/public/handle_images.go:17-88`
 
-`````go
+```go
 func decodeArtworkID(tokenString string) (model.ArtworkID, error) {
     token, err := auth.TokenAuth.Decode(tokenString)  // 仅解码，不验证过期
     if err != nil {
@@ -285,7 +310,7 @@ func decodeArtworkID(tokenString string) (model.ArtworkID, error) {
 
 **核心文件**: `server/public/handle_streams.go:17-97`
 
-`````go
+```go
 func decodeStreamInfo(tokenString string) (shareTrackInfo, error) {
     c, err := auth.Validate(tokenString)  // 完整验证（包括过期）
     if err != nil {
@@ -304,7 +329,7 @@ func decodeStreamInfo(tokenString string) (shareTrackInfo, error) {
 1. JWT 令牌验证（检查过期）
 2. 分享记录验证（如果令牌包含 `ShareID`）
 
-`````go
+```go
 if info.shareID != "" {
     share, err := pub.ds.Share(ctx).Get(info.shareID)
     if err != nil {
@@ -322,7 +347,7 @@ if info.shareID != "" {
 
 **核心文件**: `server/public/handle_shares.go:21-44`
 
-`````go
+```go
 func (pub *Router) handleShares(w http.ResponseWriter, r *http.Request) {
     s, err := pub.share.Load(r.Context(), id)
     if err != nil {
@@ -337,7 +362,7 @@ func (pub *Router) handleShares(w http.ResponseWriter, r *http.Request) {
 
 **分享加载逻辑**: `core/share.go:34-52`
 
-`````go
+```go
 func (s *shareService) Load(ctx context.Context, id string) (*model.Share, error) {
     share, err := repo.Get(id)
     if err != nil {
@@ -364,7 +389,7 @@ func (s *shareService) Load(ctx context.Context, id string) (*model.Share, error
 
 **核心文件**: `model/request/request.go:9-21`
 
-`````go
+```go
 const (
     User           = contextKey("user")           // model.User - 完整用户对象
     Username       = contextKey("username")       // string - 用户名
@@ -391,99 +416,11 @@ const (
 | `ReverseProxyIp` | ✅ 可选 | ✅ 可选 | `realIPMiddleware`（仅配置时） |
 | `InternalAuth` | ✅ 可选 | ❌ 不存在 | 插件调用时设置 |
 
-### 5.3 公开请求中关键字段的真实来源
-
-#### 5.3.1 ClientUniqueId（客户端唯一标识）
-
-**设置逻辑**: `server/middlewares.go:130-166`
-
-```go
-func clientUniqueIDMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        ctx := r.Context()
-        clientUniqueId := r.Header.Get(consts.UIClientUniqueIDHeader)
-        
-        if clientUniqueId != "" {
-            c := &http.Cookie{
-                Name:     consts.UIClientUniqueIDHeader,
-                Value:    clientUniqueId,
-                MaxAge:   consts.CookieExpiry,
-                HttpOnly: true,
-                Secure:   true,
-                SameSite: http.SameSiteStrictMode,
-                Path:     cmp.Or(conf.Server.BasePath, "/"),
-            }
-            http.SetCookie(w, c)
-        } else {
-            c, err := r.Cookie(consts.UIClientUniqueIDHeader)
-            if !errors.Is(err, http.ErrNoCookie) {
-                clientUniqueId = c.Value
-            }
-        }
-        
-        if clientUniqueId != "" {
-            ctx = request.WithClientUniqueId(ctx, clientUniqueId)
-            r = r.WithContext(ctx)
-        }
-        next.ServeHTTP(w, r)
-    })
-}
-`
-
-**公开请求中的表现**:
-- ✅ 全局中间件应用于所有路由，包括公开路由
-- ✅ 如请求携带 `X-ND-Client-Unique-Id` 头或同名 Cookie，上下文会包含该值
-- ❌ 公开处理器中**未实际使用**该字段（没有用户身份，无法关联）
-- ❌ 公开请求**不会**更新用户的 `last_access_at`
-
-#### 5.3.2 ReverseProxyIp（反向代理IP）
-
-**设置逻辑**: `server/middlewares.go:168-182`
-
-```go
-func realIPMiddleware(next http.Handler) http.Handler {
-    if conf.Server.`ExtAuth.TrustedSources` != "" {
-        return chi.Chain(
-            reqToCtx(request.ReverseProxyIp, func(r *http.Request) any { return r.RemoteAddr }),
-            middleware.RealIP,
-        ).Handler(next)
-    }
-    return middleware.RealIP(next)
-}
-`
-
-**公开请求中的表现**:
-- 仅当配置了 `ExtAuth.TrustedSources` 时才会设置
-- 用于外部认证头的 IP 白名单验证
-- 公开请求中主要用于日志记录
-
-#### 5.3.3 JWT 令牌验证（JWTVerifier）
-
-**验证逻辑**: `server/auth.go:174-176`
-
-```go
-func JWTVerifier(next http.Handler) http.Handler {
-    return jwtauth.Verify(auth.TokenAuth, 
-        tokenFromHeader,
-        jwtauth.TokenFromCookie,
-        jwtauth.TokenFromQuery,
-    )(next)
-}
-`
-
-**公开请求中的表现**:
-- ✅ 全局中间件，公开请求也会经过
-- ✅ 如携带有效 JWT，令牌会被解析并存入上下文
-- ❌ **但不会强制要求认证**：无令牌或无效令牌的请求会继续执行
-- ❌ 公开处理器不会从上下文读取用户信息
-
-> **关键差异**: `JWTVerifier` 是"可选验证"，只验证但不拒绝；`Authenticator` 是"强制验证"，无有效认证则返回 401。
-
-### 5.4 业务层使用示例
+### 5.3 业务层使用示例
 
 **管理员权限检查**: `server/nativeapi/native_api.go:258-267`
 
-`````go
+```go
 func adminOnlyMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         user, ok := request.UserFrom(r.Context())
@@ -498,7 +435,7 @@ func adminOnlyMiddleware(next http.Handler) http.Handler {
 
 **用户最后访问时间更新**: `server/middlewares.go:304-329`
 
-`````go
+```go
 func UpdateLastAccessMiddleware(ds model.DataStore) func(next http.Handler) http.Handler {
     return func(next http.Handler) http.Handler {
         return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -533,7 +470,7 @@ func UpdateLastAccessMiddleware(ds model.DataStore) func(next http.Handler) http
 
 **核心文件**: `server/public/handle_shares.go:100-109`
 
-`````go
+```go
 func encodeMediafileShare(s model.Share, id string) string {
     claims := auth.Claims{
         ID:      id,        // 媒体文件 ID
@@ -554,11 +491,13 @@ func encodeMediafileShare(s model.Share, id string) string {
 
 | 令牌类型 | 过期检查点 | 过期后行为 |
 |---------|-----------|-----------|
-| 会话令牌 | `JWTVerifier` (jwtauth 库) | 返回 401 Unauthorized |
+| 会话令牌 | `Authenticator` → `UsernameFromToken` → `jwtauth.FromContext()` | 返回 401 Unauthorized |
 | 分享流令牌 | `auth.Validate()` + 分享记录检查 | 返回 400 Bad Request 或 410 Gone |
 | 分享页面 | `share.Load()` 中检查 | 返回 410 Gone |
 | 转码令牌 | `parseTranscodeParams()` | 返回错误，需要重新获取 |
 | 公开图片 | **不检查过期** | 永久可访问（只要签名有效） |
+
+> **重要澄清**: 会话令牌的过期检查**不发生在 `JWTVerifier`**。`JWTVerifier` 仅将过期错误存入上下文但不拒绝请求；真正的过期检查发生在 `Authenticator` 中间件调用 `UsernameFromToken` 时。
 
 ### 7.2 撤销机制
 
@@ -566,7 +505,7 @@ func encodeMediafileShare(s model.Share, id string) string {
 
 分享令牌可以通过删除分享记录实现"软撤销"：
 
-`````go
+```go
 // 分享流访问时的二次检查
 if info.shareID != "" {
     share, err := pub.ds.Share(ctx).Get(info.shareID)
@@ -632,4 +571,56 @@ if info.shareID != "" {
 | Native API 路由 | `server/nativeapi/native_api.go` | 56-98 |
 | Subsonic 认证中间件 | `server/subsonic/middlewares.go` | 100-181 |
 | 转码令牌处理 | `core/stream/token.go` | 15-148 |
+
+---
+
+## 10. 统一结论与口径澄清
+
+本节总结所有关键权限边界，确保理解一致，无口径冲突。
+
+### 10.1 公开下载路由生效条件（三层控制）
+
+**代码依据**: `server/public/public.go:48-57`
+
+| 检查层级 | 检查位置 | 生效条件 | 不满足时行为 |
+|---------|---------|---------|-------------|
+| 1 | 路由注册 | `EnableSharing = true` | ❌ 路由不存在，返回 404 |
+| 2 | 路由注册 | `EnableDownloads = true` | ❌ 路由不存在，返回 404 |
+| 3 | 业务逻辑 | `share.Downloadable = true` | ✅ 路由存在，但返回 403 Forbidden |
+
+> **统一结论**: `/share/d/{id}` 路由的**挂载前提**是 `EnableSharing && EnableDownloads` 同时为 `true`。即使路由挂载，下载请求仍需通过 `share.Downloadable` 的业务层检查。
+
+### 10.2 会话令牌过期检查边界
+
+**代码依据**: `server/auth.go:174-176`, `server/auth.go:260-272`, `server/auth.go:187-198`
+
+| 中间件 | 职责 | 是否检查过期 | 是否拒绝请求 |
+|-------|------|-------------|-------------|
+| `JWTVerifier` | 全局可选验证：解析令牌、验证签名、将令牌/错误存入上下文 | ⚠️ jwtauth 库内部会检测过期，但仅将错误存入上下文 | ❌ 不拒绝，请求继续执行 |
+| `Authenticator` | 强制认证：通过 `UsernameFromToken` 尝试获取有效用户名 | ✅ 间接检查：如令牌过期，`jwtauth.FromContext()` 返回错误 → 无有效用户名 | ✅ 返回 401 Unauthorized |
+
+> **统一结论**: 会话令牌的过期检查**发生在 `Authenticator` 中间件**，而非 `JWTVerifier`。`JWTVerifier` 仅验证签名并传递结果，不做访问控制决策。
+
+### 10.3 公开路由与全局中间件关系
+
+**代码依据**: `server/server.go:148-185`, `server/public/public.go:38-60`
+
+| 中间件类型 | 是否应用于公开路由 | 具体说明 |
+|-----------|-------------------|---------|
+| 全局中间件 | ✅ 全部应用 | `JWTVerifier`、`realIPMiddleware`、`clientUniqueIDMiddleware`、日志、压缩、CORS 等 |
+| 认证中间件 | ❌ 不应用 | `Authenticator`、`JWTRefresher`、`UpdateLastAccessMiddleware` |
+
+> **统一结论**: 公开路由经过完整的全局中间件链，因此公开请求上下文中包含 `RequestID`、`RealIP`、`ClientUniqueId` 等字段。但公开路由不经过认证中间件，因此不强制用户登录。
+
+### 10.4 公开请求中 ClientUniqueId 的真实来源
+
+**代码依据**: `server/middlewares.go:92-118`
+
+| 优先级 | 来源 | 说明 |
+|-------|------|------|
+| 1 | `X-ND-Client-Unique-Id` 请求头 | 客户端可主动设置 |
+| 2 | 同名 Cookie | 如无请求头则尝试从 Cookie 读取 |
+| 3 | 空字符串 | 两者都没有则为空 |
+
+> **统一结论**: `ClientUniqueId` 是**客户端自声明的标识**，由全局中间件 `clientUniqueIDMiddleware` 设置，不依赖认证状态，公开请求中同样可用。
 
