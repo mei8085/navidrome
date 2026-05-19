@@ -1,5 +1,41 @@
 # Navidrome 播放列表实现机制分析
 
+## 事务口径与位置ID稳定性最终总结
+
+### 一、写路径事务边界汇总
+
+| 操作 | 事务模式 | 并发风险 | 说明 |
+|------|----------|----------|------|
+| Create | `WithTxImmediate` | 低 | Service 层包裹整个 Put 操作 |
+| Update（先删后加） | `WithTxImmediate` | 低 | Service 层包裹 Delete + Add |
+| Update（仅元数据） | 无事务 | 极低 | 单条 UPDATE，原子性由 SQLite 保证 |
+| Delete（播放列表） | 无事务 | 低 | 单条 DELETE + 文件系统操作 |
+| RemoveTracks | `WithTx` | 中 | Service 层包裹 Delete + renumber |
+| ReorderTrack | `WithTx` | 中 | Service 层包裹四条 UPDATE |
+| **AddTracks/AddAlbums/AddArtists/AddDiscs** | **无事务** | **高** | `SELECT max(id)` + 分块 INSERT，完全非原子 |
+| **Native 批量添加四类来源** | **无外层事务** | **极高** | 四类 AddXxx 顺序独立执行，部分失败不回滚 |
+| GC/removeOrphans | `WithTx` | 低 | Scanner 层包裹整个 GC 过程 |
+
+### 二、位置ID稳定性边界
+
+| 操作类型 | 位置ID稳定性 | 说明 |
+|----------|-------------|------|
+| 添加歌曲 | ✅ 稳定 | 仅追加新ID，不改变已有ID |
+| 重排序 | ⚠️ 部分稳定 | 仅调整相关位置，其他位置ID不变 |
+| 更新元数据 | ✅ 稳定 | 完全不影响 playlist_tracks |
+| **删除歌曲（任何形式）** | ❌ 不稳定 | **触发 renumber，所有位置ID全部重新分配** |
+| **孤儿清理（GC）** | ❌ 不稳定 | **触发 renumber，所有位置ID全部重新分配** |
+| **先删后加 Update** | ❌ 不稳定 | **删除触发 renumber，所有位置ID全部重新分配** |
+
+### 三、核心结论
+
+1. **Add 操作无事务是最大风险点**：`SELECT max(id)` 和分块 INSERT 之间没有事务保护，并发添加会导致唯一约束违反
+2. **位置ID是临时标识**：任何删除操作都会触发 renumber，导致所有位置ID重新分配，客户端绝不能缓存
+3. **Subsonic 和 Native API 并发安全性都低**：无论是索引还是位置ID，在并发修改场景下都可能错位
+4. **设计权衡**：Navidrome 假设播放列表并发修改概率低，优先保证性能和实现简单，牺牲了强一致性
+
+---
+
 ## 1. 整体架构分层
 
 播放列表在 Navidrome 中横跨三个协作层：
@@ -282,19 +318,19 @@ func (r *playlistTrackRepository) Reorder(pos int, newPos int) error {
 
 ## 4. 持久层更新入口汇总
 
-| 操作 | 入口方法 | 事务边界 | 核心逻辑 |
-|------|----------|----------|----------|
+| 操作 | 入口方法 | 事务边界（Service层） | 核心逻辑 |
+|------|----------|----------------------|----------|
 | 创建/替换 | `Put(pls *Playlist)` | `WithTxImmediate` | 先存元数据，再调用 `updateTracks` |
-| 添加歌曲 | `Tracks().Add(ids)` | 无（单条SQL） | 查询 `max(id)`，调用 `addTracks` 追加 |
-| 按专辑添加 | `Tracks().AddAlbums(ids)` | 无 | 查询专辑歌曲后调用 `Add` |
-| 按艺术家添加 | `Tracks().AddArtists(ids)` | 无 | 查询艺术家歌曲后调用 `Add` |
-| 按碟片添加 | `Tracks().AddDiscs(ids)` | 无 | 查询碟片歌曲后调用 `Add` |
+| 添加歌曲 | `Tracks().Add(ids)` | **无事务** | `SELECT max(id)` + 分块 `INSERT`，完全无事务 |
+| 按专辑添加 | `Tracks().AddAlbums(ids)` | **无事务** | 查询专辑歌曲后调用 `Add` |
+| 按艺术家添加 | `Tracks().AddArtists(ids)` | **无事务** | 查询艺术家歌曲后调用 `Add` |
+| 按碟片添加 | `Tracks().AddDiscs(ids)` | **无事务** | 查询碟片歌曲后调用 `Add` |
 | 删除歌曲 | `Tracks().Delete(ids)` | `WithTx` | 删除后调用 `renumber()` 重编号 |
 | 重排序 | `Tracks().Reorder(pos, newPos)` | `WithTx` | 四步算法原地调整 |
-| 更新元数据 | `Put(pls, cols...)` | 无 | 仅更新指定字段（名称、注释、公开状态） |
+| 更新元数据 | `Put(pls, cols...)` | 无事务 | 仅更新指定字段（名称、注释、公开状态） |
 | 先删后加更新 | `Update(playlistID, ...)` | `WithTxImmediate` | 先 Delete 再 Add，中间自动 renumber |
-| 统计刷新 | `refreshCounters(pls)` | 无 | 聚合查询更新 duration/size/song_count |
-| 孤儿清理 | `removeOrphans()` | `WithTx` (GC内) | 删除无效引用 + renumber |
+| 统计刷新 | `refreshCounters(pls)` | 无事务 | 聚合查询更新 duration/size/song_count |
+| 孤儿清理 | `removeOrphans()` | `WithTx` (外层GC事务) | 删除无效引用 + renumber |
 
 ---
 
@@ -339,32 +375,57 @@ func (s *SQLStore) WithTxImmediate(block func(tx model.DataStore) error, scope .
 - `WithTxImmediate` 通过执行一个写操作（`Put` 临时属性）强制 SQLite 将事务升级为 IMMEDIATE 模式，避免死锁
 - `WithTx` 使用默认的 DEFERRED 模式，适用于只读或轻量写操作
 
-### 5.2 各操作的事务边界
+### 5.2 各操作的事务边界（最终统一口径）
 
-| 操作 | 事务模式 | 原因 |
-|------|----------|------|
-| Create | `WithTxImmediate` | 可能同时写入 playlist 和 playlist_tracks，避免并发创建死锁 |
-| Update (先删后加) | `WithTxImmediate` | 删除 + renumber + 添加 必须原子执行 |
-| Update (metadata only) | 无事务 | 单条 UPDATE，原子性由SQLite保证 |
-| Delete (playlist) | 无事务 | 单条 DELETE + 文件系统操作（非事务） |
-| RemoveTracks | `WithTx` | 删除 + renumber 需要原子性 |
-| ReorderTrack | `WithTx` | 四条 UPDATE 必须原子执行 |
-| **AddTracks** | **无事务** | **SELECT max(id) + 分块 INSERT，完全无事务，存在并发冲突风险** |
-| AddAlbums/AddArtists/AddDiscs | 无事务 | 先查询再插入，独立操作无外层事务 |
-| **Native 批量添加四类来源** | **无外层事务** | **四类来源顺序执行，部分失败不回滚** |
-| GC/removeOrphans | `WithTx` (外层) | 整个GC过程在一个大事务中 |
+| 操作 | 入口文件 | 事务模式 | 事务位置 | 并发风险 |
+|------|----------|----------|----------|----------|
+| Create | `core/playlists/playlists.go:107` | `WithTxImmediate` | Service 层包裹整个 Put 操作 | 低（立即事务避免死锁） |
+| Update（先删后加） | `core/playlists/playlists.go:166` | `WithTxImmediate` | Service 层包裹 Delete + Add | 低（原子执行） |
+| Update（仅元数据） | `core/playlists/playlists.go:197` | 无事务 | 直接调用 Put(pls, cols...) | 极低（单条 UPDATE） |
+| Delete（播放列表） | `core/playlists/playlists.go:149` | 无事务 | 直接调用 Delete(id) | 低（单条 DELETE + 文件操作） |
+| RemoveTracks | `core/playlists/playlists.go:278` | `WithTx` | Service 层包裹 Delete | 中（事务内 renumber） |
+| ReorderTrack | `core/playlists/playlists.go:287` | `WithTx` | Service 层包裹 Reorder | 中（事务内四条 UPDATE） |
+| **AddTracks** | `core/playlists/playlists.go:252` | **无事务** | 直接调用 Add(ids) | **高（SELECT max(id) 和 INSERT 非原子）** |
+| AddAlbums | `core/playlists/playlists.go:258` | **无事务** | 直接调用 AddAlbums(ids) | **高** |
+| AddArtists | `core/playlists/playlists.go:265` | **无事务** | 直接调用 AddArtists(ids) | **高** |
+| AddDiscs | `core/playlists/playlists.go:271` | **无事务** | 直接调用 AddDiscs(ids) | **高** |
+| **Native 批量添加四类来源** | `server/nativeapi/playlists.go:121-167` | **无外层事务** | Handler 内顺序调用四类 AddXxx | **极高（四类操作独立，部分失败不回滚）** |
+| GC/removeOrphans | `scanner/scanner.go:233` | `WithTx` | Scanner 层包裹整个 GC | 低（整个GC在一个事务中） |
 
-#### 5.2.1 Add 操作的并发风险
+#### 5.2.1 Add 操作的并发风险详解
 
 `AddTracks` 内部的 `SELECT max(id)` 和 `INSERT` 之间没有事务保护：
+
+```go
+// persistence/playlist_track_repository.go:143-159
+func (r *playlistTrackRepository) Add(mediaFileIds []string) (int, error) {
+    // Step 1: 查询 max(id) - 自动提交
+    sq := r.newSelect().Columns("max(id) as max").Where(Eq{"playlist_id": r.playlistId})
+    var res struct{ Max sql.NullInt32 }
+    err := r.queryOne(sq, &res)
+    
+    // Step 2: 分块插入 - 每块自动提交
+    return len(mediaFileIds), r.playlistRepo.addTracks(r.playlistId, int(res.Max.Int32+1), mediaFileIds)
+}
+```
+
+**并发冲突时序**：
 ```
 时间点 | 请求A | 请求B
 -------|-------|-------
   T1   | SELECT max(id) → 100 |
   T2   |       | SELECT max(id) → 100
   T3   | INSERT 从 101 开始 |
-  T4   |       | INSERT 也从 101 开始 → 唯一约束违反！
+  T4   |       | INSERT 也从 101 开始 → UNIQUE constraint failed!
 ```
+
+#### 5.2.2 事务模式选择的设计逻辑
+
+| 事务模式 | 使用场景 | 设计考量 |
+|----------|----------|----------|
+| `WithTxImmediate` | Create、Update（先删后加） | 涉及多个表修改，避免 SQLite 死锁 |
+| `WithTx` | RemoveTracks、ReorderTrack、GC | 多条 SQL 需要原子性，但并发概率低 |
+| 无事务 | AddTracks、AddAlbums 等 | 性能优先，假设并发添加概率低 |
 
 ### 5.3 事务嵌套支持
 
@@ -823,10 +884,43 @@ idxToRemove = [1, 3]
 | 批量删除顺序 | 不影响结果 | 不影响结果 |
 | 风险表现 | 索引错位删除错误歌曲 | 位置ID重分配删除错误歌曲 |
 
+### 8.7 位置 ID 稳定性边界（最终结论）
+
+#### 8.7.1 哪些操作会改变所有位置ID？
+
+**renumber 触发场景**（完整列表）：
+
+| 场景 | 触发点 | 位置ID变化 |
+|------|--------|------------|
+| 用户主动删除歌曲 | `playlist_track_repository.go:197` | ✅ 全部重新分配 |
+| 清空播放列表 | `playlist_track_repository.go:206` | ✅ 全部重新分配 |
+| 孤儿清理（GC） | `playlist_repository.go:379` | ✅ 全部重新分配 |
+| 先删后加 Update | `Delete` 内部调用 | ✅ 全部重新分配 |
+| **仅添加歌曲** | `addTracks` | ❌ 不改变已有ID |
+| **仅重排序** | `Reorder` | ❌ 仅调整相关位置 |
+| **仅更新元数据** | `Put(pls, cols...)` | ❌ 不影响 |
+
+#### 8.7.2 稳定性边界总结
+
+**位置ID在以下场景是稳定的**：
+- 播放列表没有任何删除操作（用户删除、GC孤儿清理）
+- 仅进行添加、重排序、元数据更新操作
+
+**位置ID在以下场景会失效**：
+- 任何删除操作（用户主动删除、GC清理）
+- 先删后加的 Update 操作
+
+#### 8.7.3 客户端最佳实践
+
+1. **不要缓存位置ID**：每次操作前重新获取播放列表
+2. **操作原子性**：获取列表后立即执行删除/修改操作
+3. **并发操作提示**：如果播放列表可能被多人修改，使用 `updated_at` 字段检测冲突
+4. **幂等性设计**：删除失败时不要盲目重试，先重新获取列表
+
 **重要结论**：
 - Subsonic 和 Native API 在并发场景下都不安全
 - 根本原因：`renumber` 会动态改变所有位置ID
-- 客户端必须基于最新的列表状态进行操作，或者使用更稳定的标识（如 `media_file_id`）进行删除
+- 位置ID是**临时的顺序标识**，不是**永久的唯一标识**
 
 ---
 
@@ -989,10 +1083,17 @@ func (r *playlistRepository) renumber(id string) error {
 
 **重要提示**：renumber 虽然解决了编号不连续的问题，但带来了严重的副作用——**所有歌曲的位置ID都会被重新分配**！
 
-触发 renumber 的场景包括：
-1. 用户主动删除歌曲（`Delete` 内部调用）
-2. 孤儿清理（GC 过程中调用）
-3. `DeleteAll` 清空播放列表
+**完整的 renumber 触发场景**：
+
+| 场景 | 触发点 | 位置ID变化 |
+|------|--------|------------|
+| 用户主动删除歌曲 | `playlist_track_repository.go:197` | ✅ 全部重新分配 |
+| 清空播放列表 | `playlist_track_repository.go:206` | ✅ 全部重新分配 |
+| 孤儿清理（GC） | `playlist_repository.go:379` | ✅ 全部重新分配 |
+| 先删后加 Update | `Delete` 内部调用 | ✅ 全部重新分配 |
+| **仅添加歌曲** | `addTracks` | ❌ 不改变已有ID |
+| **仅重排序** | `Reorder` | ❌ 仅调整相关位置 |
+| **仅更新元数据** | `Put(pls, cols...)` | ❌ 不影响 |
 
 **对客户端的影响**：
 - 客户端缓存的位置ID在 renumber 后全部失效
