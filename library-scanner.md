@@ -129,7 +129,7 @@ if conf.Server.Scanner.PurgeMissing == consts.PurgeMissingAlways ||
 ```
 
 **三种策略**（`consts/consts.go:139-141`）：
-- `never`（默认？需确认）: 只标记不删除，用户可手动恢复
+- `never`（**默认值**，`conf/configuration.go:817`）: 只标记不删除，用户可手动恢复
 - `always`: 每次扫描（增量或全量）都删除标记为 missing 的文件
 - `full`: 仅在全量扫描时删除 missing 文件
 
