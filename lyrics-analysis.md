@@ -319,9 +319,228 @@ if err != nil {
 
 ---
 
-## 4. 代码架构总结
+## 4. 同名歌曲多记录选取规则
 
-### 4.1 模块职责划分
+### 4.1 过滤器实现
+
+**文件位置**: `server/subsonic/filter/filters.go:111-124`
+
+```go
+func SongsByArtistTitleWithLyricsFirst(artist, title string) Options {
+    return addDefaultFilters(Options{
+        Sort:  "lyrics, updated_at",
+        Order: "desc",
+        Max:   1,
+        Filters: And{
+            Eq{"title": title},
+            Or{
+                persistence.Exists("json_tree(participants, '$.albumartist')", Eq{"value": artist}),
+                persistence.Exists("json_tree(participants, '$.artist')", Eq{"value": artist}),
+            },
+        },
+    })
+}
+```
+
+### 4.2 选取规则详解
+
+#### 过滤条件
+1. **标题精确匹配**: `Eq{"title": title}` - 歌曲标题必须完全匹配
+2. **艺术家匹配**: 通过 `OR` 条件匹配两种参与者类型
+   - `albumartist`: 专辑艺术家
+   - `artist`: 歌曲艺术家
+   - 使用 SQLite 的 `json_tree` 函数解析 JSON 格式的参与者字段
+
+#### 排序优先级（从高到低）
+1. **lyrics 字段降序**: 非空歌词排在前面（SQL 中字符串比较，非空 > 空）
+2. **updated_at 降序**: 更新时间新的排在前面
+
+#### 选取结果
+- **Max: 1** - 只返回排序后的第一条记录
+- 即：**优先选择有歌词的，歌词条件相同时选择更新时间最新的**
+
+### 4.3 测试用例验证
+
+**文件位置**: `server/subsonic/media_retrieval_test.go:113-151`
+
+测试场景：三条同名同艺术家记录，按更新时间排序，但有歌词的记录优先
+
+| ID | Lyrics | UpdatedAt | 排序结果 |
+|----|--------|-----------|----------|
+| 2 | 空（"[]"） | 2小时后（最新） | 第2名 |
+| 1 | 有歌词 | 1小时后 | 第1名（胜出） |
+| 3 | 空（"[]"） | 3小时后 | 第3名 |
+
+**结果**: 即使 ID 1 不是最新的，但因为有歌词，仍然被选中。
+
+---
+
+## 5. 两个歌词接口的差异对比
+
+Navidrome 提供两个 Subsonic API 端点获取歌词，它们的设计目标和返回格式有显著差异。
+
+### 5.1 接口概览
+
+| 特性 | GetLyrics | GetLyricsBySongId |
+|------|-----------|-------------------|
+| **API 路径** | `/rest/getLyrics` | `/rest/getLyricsBySongId` |
+| **参数** | `artist`, `title` | `id` (歌曲ID) |
+| **响应结构** | `Lyrics` (传统格式) | `LyricsList` (结构化格式) |
+| **多条歌词** | ❌ 只返回第一条 | ✅ 返回全部 |
+| **语言信息** | ❌ 丢失 | ✅ 保留 |
+| **时间轴信息** | ❌ 丢失 | ✅ 保留 |
+| **同步标记** | ❌ 丢失 | ✅ 保留 |
+
+### 5.2 GetLyrics 接口实现
+
+**文件位置**: `server/subsonic/media_retrieval.go:94-131`
+
+```go
+func (api *Router) GetLyrics(r *http.Request) (*responses.Subsonic, error) {
+    artist, _ := p.String("artist")
+    title, _ := p.String("title")
+    
+    mediaFiles, err := api.ds.MediaFile(r.Context()).GetAll(
+        filter.SongsByArtistTitleWithLyricsFirst(artist, title))
+    
+    if len(mediaFiles) == 0 {
+        return response, nil
+    }
+    
+    structuredLyrics, err := api.lyrics.GetLyrics(r.Context(), &mediaFiles[0])
+    
+    if len(structuredLyrics) == 0 {
+        return response, nil
+    }
+    
+    lyricsResponse.Artist = artist
+    lyricsResponse.Title = title
+    
+    // 关键：只取第一条歌词，丢弃时间轴，拼接成纯文本
+    var lyricsText strings.Builder
+    for _, line := range structuredLyrics[0].Line {
+        lyricsText.WriteString(line.Value + "\n")
+    }
+    
+    lyricsResponse.Value = lyricsText.String()
+    return response, nil
+}
+```
+
+**响应结构**: `server/subsonic/responses/responses.go:511-515`
+```go
+type Lyrics struct {
+    Artist string `xml:"artist,omitempty,attr"  json:"artist,omitempty"`
+    Title  string `xml:"title,omitempty,attr"   json:"title,omitempty"`
+    Value  string `xml:",chardata"              json:"value"`
+}
+```
+
+**信息丢失点**:
+1. **多条歌词**: 只取 `structuredLyrics[0]`，其他语言/版本被丢弃
+2. **时间轴**: `Line.Start` 字段完全被忽略
+3. **语言**: `Lang` 字段丢失
+4. **同步标记**: `Synced` 字段丢失
+5. **Offset**: 偏移量丢失
+
+### 5.3 GetLyricsBySongId 接口实现
+
+**文件位置**: `server/subsonic/media_retrieval.go:133-153`
+
+```go
+func (api *Router) GetLyricsBySongId(r *http.Request) (*responses.Subsonic, error) {
+    id, err := req.Params(r).String("id")
+    
+    mediaFile, err := api.ds.MediaFile(r.Context()).Get(id)
+    
+    structuredLyrics, err := api.lyrics.GetLyrics(r.Context(), mediaFile)
+    
+    // 关键：保留所有歌词，使用 buildLyricsList 构建结构化响应
+    response.LyricsList = buildLyricsList(mediaFile, structuredLyrics)
+    
+    return response, nil
+}
+```
+
+**响应结构**: `server/subsonic/responses/responses.go:545-562`
+```go
+type Line struct {
+    Start *int64 `xml:"start,attr,omitempty" json:"start,omitempty"`
+    Value string `xml:",chardata"            json:"value"`
+}
+
+type StructuredLyric struct {
+    DisplayArtist string `xml:"displayArtist,attr,omitempty" json:"displayArtist,omitempty"`
+    DisplayTitle  string `xml:"displayTitle,attr,omitempty"  json:"displayTitle,omitempty"`
+    Lang          string `xml:"lang,attr"                    json:"lang"`
+    Line          []Line `xml:"line"                         json:"line"`
+    Offset        *int64 `xml:"offset,attr,omitempty"        json:"offset,omitempty"`
+    Synced        bool   `xml:"synced,attr"                  json:"synced"`
+}
+
+type LyricsList struct {
+    StructuredLyrics []StructuredLyric `xml:"structuredLyrics,omitempty" json:"structuredLyrics,omitempty"`
+}
+```
+
+**信息完整性**:
+1. **多条歌词**: 全部保留在 `StructuredLyrics` 数组中
+2. **时间轴**: `Line.Start` 字段完整保留
+3. **语言**: `Lang` 字段保留
+4. **同步标记**: `Synced` 布尔字段保留
+5. **Offset**: 偏移量保留
+6. **元数据**: `DisplayArtist`、`DisplayTitle` 保留（缺失时从 MediaFile 补充）
+
+### 5.4 差异影响分析
+
+#### 对客户端的影响
+
+| 场景 | GetLyrics | GetLyricsBySongId |
+|------|-----------|-------------------|
+| 显示纯文本歌词 | ✅ 可用 | ✅ 可用（需提取文本） |
+| 卡拉OK歌词滚动 | ❌ 不可用（无时间轴） | ✅ 可用 |
+| 多语言切换 | ❌ 不可用（只返回第一条） | ✅ 可用 |
+| 显示歌词来源元数据 | ❌ 不可用 | ✅ 可用 |
+
+#### 向后兼容性
+
+- `GetLyrics` 是传统 Subsonic API，兼容性最好
+- `GetLyricsBySongId` 是 OpenSubsonic 扩展 API，支持更丰富的功能
+- 客户端需要根据能力选择合适的接口
+
+#### 数据获取路径差异
+
+```
+GetLyrics 路径:
+    artist/title 参数
+        ↓
+    SongsByArtistTitleWithLyricsFirst 过滤
+        ↓ (排序后取第一条)
+    MediaFile[0]
+        ↓
+    lyrics.GetLyrics()
+        ↓ (取 LyricList[0])
+    丢弃时间轴，拼接纯文本
+        ↓
+    Lyrics 响应
+
+GetLyricsBySongId 路径:
+    id 参数
+        ↓
+    MediaFile.Get(id)
+        ↓
+    lyrics.GetLyrics()
+        ↓ (保留完整 LyricList)
+    buildLyricsList() 构建结构化响应
+        ↓ (元数据降级填充)
+    LyricsList 响应
+```
+
+---
+
+## 6. 代码架构总结
+
+### 6.1 模块职责划分
 
 | 模块 | 职责 | 文件 |
 |------|------|------|
@@ -330,11 +549,22 @@ if err != nil {
 | 来源实现 | 内嵌、外部文件、插件三种来源 | `core/lyrics/sources.go` |
 | 插件适配 | WASM 插件调用与结果解析 | `plugins/lyrics_adapter.go` |
 | API 层 | Subsonic API 响应构建、元数据补充 | `server/subsonic/helpers.go` |
+| 过滤器 | 同名歌曲选取规则 | `server/subsonic/filter/filters.go` |
 
-### 4.2 设计特点
+### 6.2 设计特点
 
 1. **可扩展的来源系统**: 通过配置字符串动态支持新的来源类型
 2. **统一解析入口**: 所有来源最终都通过 `model.ToLyrics()` 解析
 3. **容错性强**: 单个来源失败不影响整体流程
 4. **插件友好**: WASM 插件只需返回原始文本，格式解析由主程序统一处理
 5. **元数据降级**: 歌词元数据缺失时自动从媒体文件补充
+6. **双接口设计**: 同时支持传统纯文本接口和现代结构化接口
+
+### 6.3 关键技术决策总结
+
+| 决策 | 说明 |
+|------|------|
+| **优先级胜出** | 多来源不合并，按配置顺序先到先得 |
+| **歌词优先排序** | 同名歌曲优先选择有歌词的记录 |
+| **信息分层暴露** | 旧接口简化，新接口完整保留全部信息 |
+| **插件原始文本协议** | 插件只需返回文本，解析逻辑集中处理 |
