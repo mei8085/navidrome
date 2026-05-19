@@ -443,7 +443,98 @@ func (r sqlRepository) updateParticipants(itemID string, participants model.Part
 - 选择性扫描：`scanner.go:79-94` 构建 `targets map`，`folder_repository.go:138-170` 批量查询目标文件夹
 - 全量扫描：`scanner.go:67-69` 初始化 `changesDetected=true`，`phase_1_folders.go:234` 强制导入所有文件
 
-### 8.6 GC 清理流程
+### 8.6 DB Optimize 触发条件
+
+#### 调用链分析
+
+`runOptimize` 在 `scanner.go:138-167` 的 `scanFolders()` 中作为 Final Step 调用，**无论扫描类型如何都会被调用**：
+
+```go
+// scanner.go:154-166
+// Final Steps (cannot be parallelized):
+s.runGC(ctx, &state),
+s.runRefreshStats(ctx, &state),
+s.runUpdateLibraries(ctx, &state),
+s.runOptimize(ctx),  // ← 总是调用，无前置条件
+```
+
+但 `db.Optimize()` 内部有开关：
+
+```go
+// db/db.go:120-148
+func Optimize(ctx context.Context) {
+    if !conf.Server.DevOptimizeDB {  // ← 总开关
+        return
+    }
+    // 遍历所有打开的连接，执行 PRAGMA optimize
+    for range numConns {
+        conn, _ := Db().Conn(ctx)
+        _, _ = conn.ExecContext(ctx, "PRAGMA optimize;")
+    }
+}
+```
+
+#### 双重 Optimize 机制
+
+实际上存在 **两层** optimize 调用：
+
+| 调用位置 | 调用时机 | PRAGMA 参数 | 说明 |
+|---------|---------|-------------|------|
+| `library_repository.ScanEnd()` | 每个库扫描完成时 | `optimize=0x10000` | 仅检查表大小，不运行 ANALYZE |
+| `db.Optimize()` → `runOptimize` | 所有扫描完成后 | `optimize`（无参数） | 完整 optimize，可能运行 ANALYZE |
+
+**代码位置**：
+- 第一层：`persistence/library_repository.go:182-184`（在 `ScanEnd` 内，每个库一次）
+- 第二层：`db/db.go:138`（在 `runOptimize` 内，扫描完成后统一调用）
+
+#### DevOptimizeDB 配置影响
+
+`DevOptimizeDB` 默认值为 `true`（`conf/configuration.go:880`），但在以下场景中作为总开关：
+
+| 场景 | 代码位置 | 行为 |
+|-----|---------|------|
+| 启动时 | `db/db.go:50-55` | `true` 时执行 `PRAGMA optimize=0x10002` |
+| 迁移后 | `db/db.go:106-111` | `true` 且有 schema 变更时执行 `PRAGMA optimize` |
+| 扫描时（ScanEnd） | `library_repository.go:182-184` | `true` 时执行 `PRAGMA optimize=0x10000` |
+| 扫描时（runOptimize） | `db/db.go:121-123` | `true` 时遍历连接执行 `PRAGMA optimize` |
+| 强制全量重扫 | `db/migrations/migration.go:25-30` | `true` 时执行 `ANALYZE` |
+
+> **重要结论**：之前文档中"全量扫描才执行 optimize"的描述不准确。实际上 **所有扫描类型（增量/全量/选择性）都会调用 `runOptimize`**，但实际执行与否完全由 `DevOptimizeDB` 配置决定。
+
+### 8.7 PurgeMissing 边界行为
+
+#### 基础触发逻辑
+
+`phase_2_missing_tracks.go:348-352`：
+
+```go
+if conf.Server.Scanner.PurgeMissing == consts.PurgeMissingAlways || 
+   (conf.Server.Scanner.PurgeMissing == consts.PurgeMissingFull && p.state.fullScan) {
+    if err = p.purgeMissing(); err != nil { ... }
+}
+```
+
+#### 四种配置 × 三种扫描模式的真值表
+
+| PurgeMissing 配置 | 增量扫描 | 全量扫描 | 选择性扫描 (fullScan=false) | 选择性扫描 (fullScan=true) |
+|-------------------|---------|---------|----------------------------|----------------------------|
+| `never` | ❌ 不执行 | ❌ 不执行 | ❌ 不执行 | ❌ 不执行 |
+| `always` | ✅ 执行 | ✅ 执行 | ✅ 执行 | ✅ 执行 |
+| `full` | ❌ 不执行 | ✅ 执行 | ❌ 不执行 | ✅ **执行** |
+
+#### selective + fullScan=true 的边界情况
+
+当选择性扫描（`isSelectiveScan()=true`）且 `fullScan=true` 时，`PurgeMissing=full` **会触发清理**。
+
+这种组合可能在以下场景出现：
+1. 选择性扫描触发时，检测到之前有未完成的全量扫描（`lib.FullScanInProgress=true`），自动升级为全量扫描（`scanner.go:115-127`）
+2. 外部调用时显式传入 `fullScan=true` + `targets` 参数
+
+**代码证据**：`scanner.go:115-127` 的自动升级逻辑会将 `state.fullScan` 设为 `true`，而 PurgeMissing 判断只看 `p.state.fullScan`，不关心是否为选择性扫描。
+
+**注意**：此时 `purgeMissing()` 会调用 `MediaFile.DeleteAllMissing()` 删除 **所有库中** 标记为 missing 的文件，而不仅仅是目标文件夹内的。这是因为 `DeleteAllMissing()` 的 WHERE 条件只有 `missing=true`，没有 library_id 或 folder_id 限制。
+
+### 8.8 GC 清理流程
 
 扫描完成后在 `persistence.go:170-202` 的 `GC()` 中执行，**顺序执行**以下清理：
 
