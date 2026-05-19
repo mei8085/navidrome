@@ -34,8 +34,8 @@ Navidrome 封面管理采用 **责任链模式 + 策略模式** 的组合设计�
 │              artworkReader 接口族（策略模式）                 │
 │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────┐ │
 │  │ albumReader     │  │ artistReader    │  │ discReader  │ │
-│  │ playlistReader  │  │ radioReader     │  │ resizedReader│ │
-│  │ mediafileReader │  │                 │  │             │ │
+│  │ mediafileReader │  │ playlistReader  │  │ radioReader │ │
+│  │ resizedReader   │  │                 │  │             │ │
 │  └─────────────────┘  └─────────────────┘  └─────────────┘ │
 │  共同接口：Key() / LastUpdated() / Reader()                 │
 └─────────────────────────────────────────────────────────────┘
@@ -193,19 +193,21 @@ const maxArtistFolderTraversalDepth = 3  // 最多向上查找 3 层父目录
 
 ### 2.4 媒体文件封面（MediaFile）决策链
 
-**无独立配置项**，优先级逻辑硬编码在 `reader_mediafile.go:66-82`：
+**特性开关**：`EnableMediaFileCoverArt`，默认 `true`（`conf/configuration.go:752`）
+
+**决策链构建逻辑**（`core/artwork/reader_mediafile.go:66-81`）：
 
 ```go
 func (a *mediafileArtworkReader) Reader(ctx context.Context) (io.ReadCloser, string, error) {
     var ff []sourceFunc
-    // 如果媒体文件自身的 CoverArtID 是媒体文件类型，先尝试读取内嵌封面
+    // 仅当媒体文件有独立内嵌封面时，才尝试读取自身的内嵌封面
     if a.mediafile.CoverArtID().Kind == model.KindMediaFileArtwork {
         ff = []sourceFunc{
-            fromTag(ctx, a.lib.FS, a.mediafile.Path),      // taglib 读取
-            fromFFmpegTag(ctx, a.a.ffmpeg, a.lib.Abs(a.mediafile.Path)),  // ffmpeg 回退
+            fromTag(ctx, a.lib.FS, a.mediafile.Path),       // 1. taglib 读取媒体文件内嵌封面
+            fromFFmpegTag(ctx, a.a.ffmpeg, a.lib.Abs(a.mediafile.Path)),  // 2. ffmpeg 回退
         }
     }
-    // 回退逻辑：多碟专辑回退到光碟封面，单碟专辑回退到专辑封面
+    // 多碟专辑 → 回退到光碟封面；单碟专辑 → 回退到专辑封面
     if len(a.album.Discs) > 1 {
         ff = append(ff, fromAlbum(ctx, a.a, a.mediafile.DiscCoverArtID()))
     } else {
@@ -215,20 +217,45 @@ func (a *mediafileArtworkReader) Reader(ctx context.Context) (io.ReadCloser, str
 }
 ```
 
+**关键判断条件**（`model/mediafile.go:117-124`）：
+```go
+func (mf MediaFile) CoverArtID() ArtworkID {
+    // 仅当 HasCoverArt=true 且 EnableMediaFileCoverArt=true 时，才使用媒体文件自身的封面
+    if mf.HasCoverArt && conf.Server.EnableMediaFileCoverArt {
+        return artworkIDFromMediaFile(mf)
+    }
+    // 否则回退到光碟或专辑封面
+    return mf.DiscCoverArtID()
+}
+```
+
 **完整决策链**：
 
 ```
-1. fromTag(mediafile.Path)             — taglib 读取媒体文件自身的内嵌封面
-2. fromFFmpegTag(mediafile.Path)       — ffmpeg 读取内嵌封面（taglib 失败后）
-3. 回退逻辑：
-   ├─ 多碟专辑 → fromAlbum(DiscCoverArtID)   — 回退到对应光碟的封面
-   └─ 单碟专辑 → fromAlbum(AlbumCoverArtID)  — 回退到专辑封面
+┌─ 前提条件：mediafile.CoverArtID().Kind == KindMediaFileArtwork
+│    即：mf.HasCoverArt == true 且 conf.Server.EnableMediaFileCoverArt == true
+│
+├─ 1. fromTag(媒体文件路径)         — taglib 读取媒体文件内嵌封面
+│       ├─ 成功 → 返回
+│       └─ 失败 → 继续
+│
+├─ 2. fromFFmpegTag(媒体文件路径)   — ffmpeg 读取媒体文件内嵌封面
+│       ├─ 成功 → 返回
+│       └─ 失败 → 继续
+│
+└─ 3. 回退逻辑（始终存在，不受前提条件影响）
+       ├─ 多碟专辑 → fromAlbum(光碟封面ID)
+       │       ├─ 成功 → 返回光碟封面
+       │       └─ 失败 → 光碟内部继续回退到专辑封面
+       └─ 单碟专辑 → fromAlbum(专辑封面ID)
+               ├─ 成功 → 返回专辑封面
+               └─ 失败 → 返回 ErrUnavailable
 ```
 
-**关键特性**：
-- 只有当 `mediafile.CoverArtID().Kind == KindMediaFileArtwork` 时才会尝试读取自身的内嵌封面
-- 如果媒体文件没有独立的内嵌封面（CoverArtID 指向专辑或光碟），直接跳过后备逻辑
-- 这是唯一**不依赖用户配置字符串**的封面类型，优先级完全由代码逻辑决定
+**设计意图**：
+- 允许同一专辑内不同音轨有不同封面（如合集专辑）
+- 但默认行为是所有音轨共享专辑封面（通过回退实现）
+- `EnableMediaFileCoverArt` 开关允许用户完全禁用媒体文件级别的封面
 
 ---
 
@@ -291,20 +318,42 @@ func (a *playlistArtworkReader) Reader(ctx context.Context) (io.ReadCloser, stri
 1. **用户上传**：`data/cache/images/pl-<id>_cover.*`
 2. **边车文件**：播放列表文件同目录下同名图片（如 `my.m3u8` → `my.jpg`）
 3. **外部 URL**：`playlist.ExternalImageURL` 字段，支持 http/https 或本地路径
-   - HTTP URL：需要 `EnableM3UExternalAlbumArt = true` 才会尝试
-   - 本地路径：直接读取文件
+   - HTTP URL 受 `EnableM3UExternalAlbumArt` 配置控制，默认 `false`（`conf/configuration.go:751`）
 4. **自动拼图**：随机取 4 张专辑封面拼成 2x2 网格
-5. **占位图**：`resources/album-art-placeholder.png`（嵌入式资源）
+5. **占位图**：`resources/album-art-placeholder.png`（编译时嵌入的资源）
 
-**修正结论**：播放列表**理论上永不失败**，因为最后有 `fromAlbumPlaceholder()` 兜底。
-但 `fromAlbumPlaceholder()` 忽略了 `resources.FS().Open()` 的错误返回（`sources.go:184-188`），如果嵌入式资源损坏，极端情况下仍可能返回 nil。
+**兜底条件修正**：
 
-**自动拼图降级逻辑**（`core/artwork/reader_playlist.go:187-195`）：
-- 取到 1 张 → 直接返回该图
-- 取到 2 张 → [A, B, B, A] 对称排列
-- 取到 3 张 → [A, B, C, A] 排列
-- 取到 4 张 → [A, B, C, D] 正常排列
-- 取到 0 张 → 返回错误，继续到占位图
+之前的结论"播放列表永不失败"不完全准确。实际情况是：
+
+- **理论上永不失败**：`fromAlbumPlaceholder()` 调用 `resources.FS().Open(consts.PlaceholderAlbumArt)`，该资源是编译时嵌入的，理论上不会失败
+- **实际上可能失败**：如果嵌入式资源在构建时出错或损坏，`Open()` 可能返回 error
+- **代码层面没有特殊保证**：`fromAlbumPlaceholder()` 没有捕获或忽略错误，错误会正常返回
+- **错误传递路径**：如果占位图打开失败，错误会返回给 `selectImageReader`，最终返回 `ErrUnavailable` 给调用方
+
+**占位图实现**（`core/artwork/sources.go:184-189`）：
+```go
+func fromAlbumPlaceholder() sourceFunc {
+    return func() (io.ReadCloser, string, error) {
+        r, _ := resources.FS().Open(consts.PlaceholderAlbumArt)  // 忽略错误，r 可能为 nil
+        return r, consts.PlaceholderAlbumArt, nil
+    }
+}
+```
+
+> **注意**：代码中使用 `r, _ := ...` 忽略了 `Open()` 的错误。如果资源不存在，`r` 将为 nil，`selectImageReader` 会认为该 sourceFunc 失败。
+> 但由于这是列表中的最后一个 sourceFunc，失败后会返回 `ErrUnavailable`。
+> 实际上，由于资源是编译时嵌入的，正常构建的程序中该资源一定存在。
+
+**HTTP 外部图片的开关限制**（`core/artwork/reader_playlist.go:96-100`）：
+```go
+if parsed.Scheme == "http" || parsed.Scheme == "https" {
+    if !conf.Server.EnableM3UExternalAlbumArt {
+        return nil, "", nil  // 开关关闭时，直接返回"不适用"，继续下一个来源
+    }
+    return fromURL(ctx, parsed)
+}
+```
 
 ---
 
@@ -322,118 +371,9 @@ func (a *radioArtworkReader) Reader(ctx context.Context) (io.ReadCloser, string,
 
 ---
 
-## 三、外部来源优先顺序的配置驱动机制
+## 三、缓存键构成逻辑详解
 
-### 3.1 Agent 优先级配置
-
-外部元数据获取的优先级完全由 `conf.Server.Agents` 配置决定。
-
-**默认配置**（`conf/configuration.go` 中 `Agents` 默认为空字符串）：
-- 当 `Agents` 为空时，仅启用 `local` Agent（本地数据，不调用外部 API）
-
-**典型配置示例**：
-```toml
-Agents = "lastfm,deezer"
-```
-
-这表示：
-1. 先尝试 Last.fm 获取元数据
-2. Last.fm 失败后尝试 Deezer
-3. 都失败则最后尝试 `local` Agent（自动追加，无需显式配置）
-
-### 3.2 Agent 列表构建逻辑
-
-**代码位置**：`core/agents/agents.go:58-97`
-
-```go
-func (a *Agents) getEnabledAgentNames() []enabledAgent {
-    // 1. 无配置时仅用 local
-    if conf.Server.Agents == "" {
-        return []enabledAgent{{name: LocalAgentName, isPlugin: false}}
-    }
-
-    configuredAgents := strings.Split(conf.Server.Agents, ",")
-
-    // 2. 自动追加 local（如果未在配置中）
-    hasLocalAgent := slices.Contains(configuredAgents, LocalAgentName)
-    if !hasLocalAgent {
-        configuredAgents = append(configuredAgents, LocalAgentName)
-    }
-
-    // 3. 过滤有效 Agent（内置或插件）
-    var validAgents []enabledAgent
-    for _, name := range configuredAgents {
-        isBuiltIn := Map[name] != nil
-        isPlugin := slices.Contains(availablePlugins, name)
-        if isBuiltIn {
-            validAgents = append(validAgents, enabledAgent{name: name, isPlugin: false})
-        } else if isPlugin {
-            validAgents = append(validAgents, enabledAgent{name: name, isPlugin: true})
-        }
-    }
-    return validAgents
-}
-```
-
-**关键规则**：
-1. `local` Agent **始终**被包含（自动追加到末尾）
-2. 配置为空时，**仅**使用 `local` Agent
-3. 配置顺序决定调用顺序
-4. 无效的 Agent 名称会被静默过滤
-
-### 3.3 Agent 执行顺序
-
-**代码位置**：`core/agents/agents.go:322-345`
-
-```go
-func callAgentMethod[T comparable](ctx context.Context, agents *Agents, methodName string, fn func(Interface) (T, error)) (T, error) {
-    for _, enabledAgent := range agents.getEnabledAgentNames() {
-        ag := agents.getAgent(enabledAgent)
-        if ag == nil {
-            continue
-        }
-        result, err := fn(ag)
-        if err != nil {
-            log.Trace(ctx, "Agent method call error", ...)
-            continue  // 单个 Agent 失败，静默继续
-        }
-        if result != zero {
-            return result, nil  // 第一个成功即返回
-        }
-    }
-    return zero, ErrNotFound  // 全部失败
-}
-```
-
-**示例流程**（配置 `Agents = "lastfm,deezer"`）：
-```
-调用 ArtistImage
-    │
-    ├─► lastfm Agent
-    │     ├─ 成功 → 返回 URL
-    │     └─ 失败 → 继续
-    │
-    ├─► deezer Agent
-    │     ├─ 成功 → 返回 URL
-    │     └─ 失败 → 继续
-    │
-    └─► local Agent（自动追加）
-          └─ 失败（local 不提供图片）→ 返回 ErrNotFound
-```
-
-### 3.4 可用的内置 Agent
-
-| Agent 名称 | 能力 | 代码位置 |
-|-----------|------|----------|
-| `lastfm` | 艺术家头像、专辑封面、艺术家简介、相似艺术家 | `adapters/lastfm/agent.go` |
-| `deezer` | 艺术家头像、专辑封面 | `adapters/deezer/deezer.go` |
-| `local` | 本地热门歌曲（无图片能力） | `core/agents/local_agent.go` |
-
----
-
-## 四、缓存键构成逻辑详解
-
-### 4.1 缓存键设计目标
+### 3.1 缓存键设计目标
 
 缓存键必须满足：
 1. **实体唯一性**：不同实体的封面不能冲突
@@ -441,7 +381,7 @@ func callAgentMethod[T comparable](ctx context.Context, agents *Agents, methodNa
 3. **配置感知**：配置变更后缓存自动失效
 4. **尺寸区分**：不同尺寸/质量的图片分开缓存
 
-### 4.2 基础缓存键（cacheKey）
+### 3.2 基础缓存键（cacheKey）
 
 所有类型共享的基础结构（`core/artwork/image_cache.go:16-28`）：
 
@@ -476,11 +416,11 @@ al-al-123.1716000000000
 
 ---
 
-### 4.3 各类型缓存键扩展
+### 3.3 各类型缓存键扩展
 
 不同类型在基础键上添加配置相关的哈希后缀，确保配置变更时缓存失效。
 
-#### 4.3.1 专辑封面缓存键（`core/artwork/reader_album.go:64-76`）
+#### 3.3.1 专辑封面缓存键（`core/artwork/reader_album.go:64-76`）
 
 ```go
 func (a *albumArtworkReader) Key() string {
@@ -513,7 +453,7 @@ al-al-123.1716000000000.a1b2c3d4e5f6.true
 
 ---
 
-#### 4.3.2 艺术家封面缓存键（`core/artwork/reader_artist.go:103-111`）
+#### 3.3.2 艺术家封面缓存键（`core/artwork/reader_artist.go:103-111`）
 
 ```go
 func (a *artistReader) Key() string {
@@ -542,7 +482,7 @@ ar-ar-456.1716000000000.true.a1b2c3d4e5f6
 
 ---
 
-#### 4.3.3 媒体文件封面缓存键（`core/artwork/reader_mediafile.go:55-61`）
+#### 3.3.3 媒体文件封面缓存键（`core/artwork/reader_mediafile.go:55-61`）
 
 ```go
 func (a *mediafileArtworkReader) Key() string {
@@ -568,7 +508,7 @@ mf-mf-789.1716000000000.true
 
 ---
 
-#### 4.3.4 光碟封面缓存键（`core/artwork/reader_disc.go:116-123`）
+#### 3.3.4 光碟封面缓存键（`core/artwork/reader_disc.go:116-123`）
 
 ```go
 func (d *discArtworkReader) Key() string {
@@ -591,7 +531,18 @@ dc-al-123:1.1716000000000.a1b2c3d4e5f6
 
 ---
 
-#### 4.3.5 缩放后封面缓存键（`core/artwork/reader_resized.go:63-69`）
+#### 3.3.5 播放列表封面缓存键
+
+播放列表使用**基础键**，无额外配置字段。
+
+**完整示例**：
+```
+pl-pl-101.1716000000000
+```
+
+---
+
+#### 3.3.6 缩放后封面缓存键（`core/artwork/reader_resized.go:63-69`）
 
 ```go
 func (a *resizedArtworkReader) Key() string {
@@ -623,7 +574,7 @@ al-al-123.1716000000000.a1b2c3.300.square
 
 ---
 
-### 4.4 LastUpdate 时间戳来源
+### 3.4 LastUpdate 时间戳来源
 
 `lastUpdate` 字段取多个时间戳的最大值，确保任何相关内容变更都能使缓存失效。
 
@@ -631,7 +582,7 @@ al-al-123.1716000000000.a1b2c3.300.square
 |------|------------------------|----------|
 | 专辑 | `album.UpdatedAt`、`album.ImportedAt`、所有关联文件夹的 `ImagesUpdatedAt` | `reader_album.go:57-60` |
 | 艺术家 | 所有专辑的 `ImagesUpdatedAt`、`artist.UpdatedAt`、艺术家文件夹更新时间、图片文件夹文件修改时间 | `reader_artist.go:84-97` |
-| 媒体文件 | `mediafile.UpdatedAt`、`album.UpdatedAt`、`ImagesUpdatedAt` | `reader_mediafile.go:45-51` |
+| 媒体文件 | `mediafile.UpdatedAt`、`album.UpdatedAt`、`imagesUpdatedAt` | `reader_mediafile.go:45-51` |
 | 播放列表 | `playlist.UpdatedAt`、边车文件修改时间、外部图片文件修改时间 | `reader_playlist.go:44-59` |
 | 光碟 | 同专辑 | `reader_disc.go:109-112` |
 
@@ -639,6 +590,132 @@ al-al-123.1716000000000.a1b2c3.300.square
 - 不仅考虑实体本身的更新时间
 - 还考虑关联图片文件的更新时间（如用户替换了目录下的 cover.jpg）
 - 确保用户替换图片后缓存立即失效
+
+---
+
+## 四、外部来源优先顺序的配置驱动机制
+
+### 4.1 配置项说明
+
+外部来源的优先顺序完全由 `conf.Server.Agents` 配置项驱动。
+
+**默认值**：无显式默认值，空字符串（`conf/configuration.go` 中未设置默认值）
+
+**配置示例**：
+```ini
+Agents = "lastfm,deezer,spotify"
+```
+
+### 4.2 Agent 列表构建逻辑
+
+Agent 列表由 `getEnabledAgentNames()` 方法构建（`core/agents/agents.go:58-97`）：
+
+```go
+func (a *Agents) getEnabledAgentNames() []enabledAgent {
+    // 1. 如果没有配置 Agent，仅使用本地 Agent
+    if conf.Server.Agents == "" {
+        return []enabledAgent{{name: LocalAgentName, isPlugin: false}}
+    }
+
+    // 2. 获取可用的插件 Agent 列表
+    var availablePlugins []string
+    if a.pluginLoader != nil {
+        availablePlugins = a.pluginLoader.PluginNames("MetadataAgent")
+    }
+
+    // 3. 分割配置字符串
+    configuredAgents := strings.Split(conf.Server.Agents, ",")
+
+    // 4. 确保 LocalAgentName 始终在列表中（如果配置中没有）
+    hasLocalAgent := slices.Contains(configuredAgents, LocalAgentName)
+    if !hasLocalAgent {
+        configuredAgents = append(configuredAgents, LocalAgentName)
+    }
+
+    // 5. 过滤出有效的 Agent（内置或插件）
+    var validAgents []enabledAgent
+    for _, name := range configuredAgents {
+        isBuiltIn := Map[name] != nil
+        isPlugin := slices.Contains(availablePlugins, name)
+        if isBuiltIn {
+            validAgents = append(validAgents, enabledAgent{name: name, isPlugin: false})
+        } else if isPlugin {
+            validAgents = append(validAgents, enabledAgent{name: name, isPlugin: true})
+        } else {
+            log.Debug("Unknown agent ignored", "name", name)
+        }
+    }
+    return validAgents
+}
+```
+
+### 4.3 配置驱动的优先级规则
+
+**规则总结**：
+
+| 配置场景 | 生效的 Agent 列表（按优先级） |
+|----------|------------------------------|
+| `Agents = ""`（空） | `[local]` |
+| `Agents = "lastfm"` | `[lastfm, local]` |
+| `Agents = "lastfm,deezer"` | `[lastfm, deezer, local]` |
+| `Agents = "lastfm,deezer,local"` | `[lastfm, deezer, local]`（不重复） |
+| `Agents = "unknown,lastfm"` | `[lastfm, local]`（unknown 被忽略） |
+
+**关键特性**：
+1. **配置顺序即优先级**：配置字符串中 Agent 出现的顺序决定了调用顺序
+2. **LocalAgent 始终存在**：无论配置如何，`local` Agent 始终在列表末尾
+3. **未知 Agent 静默忽略**：配置中不存在的 Agent 名会被忽略，仅记录 Debug 日志
+4. **插件 Agent 支持**：除了内置 Agent，还支持 WASM 插件 Agent
+
+### 4.4 Agent 调用流程
+
+`callAgentMethod` 泛型函数按顺序调用 Agent（`core/agents/agents.go:322-345`）：
+
+```go
+func callAgentMethod[T comparable](ctx context.Context, agents *Agents, methodName string, fn func(Interface) (T, error)) (T, error) {
+    for _, enabledAgent := range agents.getEnabledAgentNames() {
+        ag := agents.getAgent(enabledAgent)
+        if ag == nil {
+            continue
+        }
+        result, err := fn(ag)
+        if err != nil {
+            log.Trace(ctx, "Agent method call error", ...)
+            continue  // 单个 Agent 失败，静默继续
+        }
+        if result != zero {
+            return result, nil  // 第一个返回有效结果的 Agent 获胜
+        }
+    }
+    return zero, ErrNotFound  // 全部失败
+}
+```
+
+**示例流程**（配置 `Agents = "lastfm,deezer"`）：
+
+```
+调用 ArtistImage(artistID)
+    │
+    ├─ 调用 Last.fm Agent
+    │       ├─ 成功返回 URL → 返回结果，结束
+    │       └─ 失败（网络错误/无结果）→ 继续
+    │
+    ├─ 调用 Deezer Agent
+    │       ├─ 成功返回 URL → 返回结果，结束
+    │       └─ 失败 → 继续
+    │
+    └─ 调用 Local Agent
+            ├─ 成功返回 URL → 返回结果，结束
+            └─ 失败 → 返回 ErrNotFound
+```
+
+### 4.5 配置变更的缓存失效
+
+Agent 配置变更会导致缓存自动失效，因为：
+- 专辑缓存键包含 `md5(Agents + CoverArtPriority)`（`reader_album.go:70-75`）
+- 艺术家缓存键包含 `md5(Agents)`（`reader_artist.go:105-109`）
+
+这意味着修改 `Agents` 配置后，所有相关的缓存键都会变化，旧缓存自动失效。
 
 ---
 
@@ -678,7 +755,43 @@ selectImageReader()  ── 按顺序尝试 sourceFunc 列表
 
 ### 5.2 各类型降级路径详解
 
-#### 5.2.1 专辑封面降级路径
+#### 5.2.1 媒体文件封面降级路径
+
+```
+检查前提条件：CoverArtID().Kind == KindMediaFileArtwork
+    │
+    ├─ 条件满足
+    │       ├─ fromTag(媒体文件)
+    │       │     ├─ 成功 → 返回
+    │       │     └─ 失败 → fromFFmpegTag(媒体文件)
+    │       │                  ├─ 成功 → 返回
+    │       │                  └─ 失败 → 继续回退
+    │       └─ 继续回退
+    │
+    └─ 条件不满足 → 直接回退
+           │
+           ▼
+    回退逻辑（始终执行）
+        ├─ 多碟专辑 → 回退到光碟封面
+        │       ├─ 光碟封面成功 → 返回
+        │       └─ 光碟封面失败 → 光碟内部回退到专辑封面
+        │                ├─ 专辑封面成功 → 返回
+        │                └─ 专辑封面失败 → 返回 ErrUnavailable
+        │
+        └─ 单碟专辑 → 回退到专辑封面
+                ├─ 专辑封面成功 → 返回
+                └─ 专辑封面失败 → 返回 ErrUnavailable
+```
+
+**关键代码**（`core/artwork/reader_mediafile.go:68-80`）：
+- `fromAlbum(ctx, a.a, a.mediafile.DiscCoverArtID())` — 回退到光碟封面
+- `fromAlbum(ctx, a.a, a.mediafile.AlbumCoverArtID())` — 回退到专辑封面
+
+这两个调用会递归进入对应类型的完整降级链。
+
+---
+
+#### 5.2.2 专辑封面降级路径
 
 ```
 配置优先级列表
@@ -702,16 +815,19 @@ selectImageReader()  ── 按顺序尝试 sourceFunc 列表
     │                  └─ 失败 → 继续
     │
     └─► external (外部 Agent)
-            ├─ 查 DB 缓存（仅艺术家有，专辑无）
+            ├─ 查 DB 缓存 → 有 URL → fromURL()
+            │                       ├─ 200 OK → 返回
+            │                       └─ 失败 → 继续
             │
-            └─ 同步调用 Agent
-                      ├─ Agent 1 (Last.fm)
-                      │     ├─ 成功 → 返回
-                      │     └─ 失败 → Agent 2 (Deezer)
-                      │                ├─ 成功 → 返回
-                      │                └─ 失败 → Agent 3 (local)
-                      │                           └─ 失败 → 继续
-                      │
+            └─ 无缓存 → 同步调用 Agent（按配置顺序）
+                      ├─ Agent 1 成功 → 保存到 DB → fromURL()
+                      │                              ├─ 200 OK → 返回
+                      │                              └─ 失败 → 继续
+                      ├─ Agent 1 失败 → Agent 2
+                      │                ├─ 成功 → 保存到 DB → fromURL()
+                      │                │                              ├─ 200 OK → 返回
+                      │                │                              └─ 失败 → 继续
+                      │                └─ 失败 → 继续
                       └─ 全部 Agent 失败 → 返回 ErrUnavailable
                                                     │
                                                     ▼
@@ -720,14 +836,9 @@ selectImageReader()  ── 按顺序尝试 sourceFunc 列表
                                                     └─► 返回专辑占位图
 ```
 
-**关键代码路径**：
-- 外部文件匹配：`core/artwork/sources.go:56-77`
-- 内嵌封面读取：`core/artwork/sources.go:86-166`
-- 外部来源调用：`core/artwork/sources.go:201-225`
-
 ---
 
-#### 5.2.2 艺术家封面降级路径
+#### 5.2.3 艺术家封面降级路径
 
 ```
 用户上传图片
@@ -747,7 +858,7 @@ selectImageReader()  ── 按顺序尝试 sourceFunc 列表
     └─► external (外部 Agent)
             ├─ 查 DB 缓存 → 有 URL → 返回
             │
-            └─ 无缓存 → 同步调用 Agent
+            └─ 无缓存 → 同步调用 Agent（按配置顺序）
                       ├─ Agent 1 成功 → 保存到 DB → 返回
                       ├─ Agent 1 失败 → Agent 2
                       │                ├─ 成功 → 保存到 DB → 返回
@@ -764,30 +875,6 @@ selectImageReader()  ── 按顺序尝试 sourceFunc 列表
 - 首次调用：同步调用 Agent 获取 URL，保存到 `artist.LargeImageUrl`
 - 后续调用：直接从 DB 读取 URL，过期后后台异步刷新
 - 过期时间：`conf.Server.DevArtistInfoTimeToLive`（默认 7 天）
-
----
-
-#### 5.2.3 媒体文件封面降级路径
-
-```
-mediafile.CoverArtID.Kind == KindMediaFileArtwork?
-    ├─ 是 → 尝试读取内嵌封面
-    │       ├─ fromTag(taglib)
-    │       │     ├─ 成功 → 返回
-    │       │     └─ 失败 → fromFFmpegTag
-    │       │                ├─ 成功 → 返回
-    │       │                └─ 失败 → 回退
-    │       │
-    │       └─ 回退逻辑
-    │             ├─ 多碟专辑 → fromAlbum(DiscCoverArtID) → 光碟封面
-    │             └─ 单碟专辑 → fromAlbum(AlbumCoverArtID) → 专辑封面
-    │
-    └─ 否 → 直接回退
-          ├─ 多碟专辑 → fromAlbum(DiscCoverArtID) → 光碟封面
-          └─ 单碟专辑 → fromAlbum(AlbumCoverArtID) → 专辑封面
-```
-
-**代码位置**：`core/artwork/reader_mediafile.go:66-82`
 
 ---
 
@@ -837,24 +924,26 @@ ff = append(ff, fromAlbum(ctx, d.a, albumArtID))
         │
         ▼
 播放列表 ExternalImageURL
-    ├─ 空 → 继续
     ├─ HTTP URL
-    │     ├─ EnableM3UExternalAlbumArt = false → 继续
-    │     └─ true → 网络请求
-    │           ├─ 200 OK → 返回
-    │           └─ 失败 → 继续
-    └─ 本地路径 → 读取文件
-          ├─ 存在 → 返回
-          └─ 失败 → 继续
+    │     ├─ EnableM3UExternalAlbumArt = false → 跳过（不适用）
+    │     └─ EnableM3UExternalAlbumArt = true → fromURL()
+    │                                              ├─ 200 OK → 返回
+    │                                              └─ 失败 → 继续
+    ├─ 本地路径 → 读取文件
+    │     ├─ 存在 → 返回
+    │     └─ 失败 → 继续
+    └─ 空 → 继续
         │
         ▼
 自动生成 2x2 拼图
     ├─ 随机取 4 张专辑封面
-    ├─ 取到 ≥1 张 → 拼接 → 返回
-    └─ 取到 0 张 → 失败 → 继续
+    ├─ 解码成功 → 拼接 → 返回
+    └─ 全部失败（0 张可用）→ 继续
         │
         ▼
-占位图（嵌入式资源）→ 返回
+占位图（嵌入式资源）
+    ├─ 资源存在 → 返回占位图
+    └─ 资源不存在 → 返回 ErrUnavailable
 ```
 
 **自动拼图降级**（`core/artwork/reader_playlist.go:187-195`）：
@@ -863,6 +952,12 @@ ff = append(ff, fromAlbum(ctx, d.a, albumArtID))
 - 取到 3 张 → [A, B, C, A] 排列
 - 取到 4 张 → [A, B, C, D] 正常排列
 - 取到 0 张 → 失败，继续到占位图
+
+**兜底修正**：
+- `fromAlbumPlaceholder()` 忽略了 `Open()` 的错误（`r, _ := ...`）
+- 如果嵌入式资源不存在，`r` 为 nil，`selectImageReader` 会认为失败
+- 由于这是最后一个 sourceFunc，失败后返回 `ErrUnavailable`
+- 正常构建的程序中，资源一定存在，因此**实际运行中不会失败**
 
 ---
 
@@ -959,12 +1054,14 @@ if err != nil || resized == nil {
 |------|----------|
 | **专辑封面**的默认优先级是：`cover.*` > `folder.*` > `front.*` > `embedded` > `external` | `conf/configuration.go:766` |
 | **艺术家封面**有一个硬编码的最高优先级：用户上传图片 | `core/artwork/reader_artist.go:118` |
-| **媒体文件封面**无配置项，优先级硬编码：自身内嵌封面 → 光碟/专辑封面 | `core/artwork/reader_mediafile.go:66-82` |
 | **光碟封面**有一个硬编码的最低优先级：回退到专辑封面 | `core/artwork/reader_disc.go:131-133` |
-| **播放列表封面**理论上永不失败，最后有 `fromAlbumPlaceholder()` 兜底 | `core/artwork/reader_playlist.go:74` |
+| **媒体文件封面**的前置条件：`HasCoverArt=true` 且 `EnableMediaFileCoverArt=true` | `model/mediafile.go:119` |
+| **媒体文件封面**的回退：多碟→光碟封面，单碟→专辑封面 | `core/artwork/reader_mediafile.go:76-80` |
+| **播放列表封面**的 HTTP 外部图片受 `EnableM3UExternalAlbumArt` 控制，默认关闭 | `core/artwork/reader_playlist.go:97`、`conf/configuration.go:751` |
+| **播放列表占位图**理论上永不失败（编译时嵌入资源），但代码层面没有强保证 | `core/artwork/sources.go:184-189` |
 | **内嵌封面**会尝试两次：先 taglib 后 ffmpeg | `core/artwork/reader_album.go:93-96` |
 | **电台封面**仅支持用户上传，无其他来源 | `core/artwork/reader_radio.go:32-36` |
-| **外部 Agent 顺序**由 `conf.Server.Agents` 配置决定，`local` 始终自动追加 | `core/agents/agents.go:58-77` |
+| **EnableMediaFileCoverArt** 默认值为 `true` | `conf/configuration.go:752` |
 
 ### 6.2 缓存键结论
 
@@ -972,11 +1069,21 @@ if err != nil || resized == nil {
 |------|----------|
 | 所有缓存键都包含时间戳，确保实体更新后缓存自动失效 | `core/artwork/image_cache.go:26` |
 | 专辑缓存键包含 `CoverArtPriority` 和 `Agents` 的 MD5，配置变更自动失效 | `core/artwork/reader_album.go:64-76` |
-| 媒体文件缓存键包含 `EnableMediaFileCoverArt` 开关 | `core/artwork/reader_mediafile.go:55-61` |
+| 媒体文件缓存键包含 `EnableMediaFileCoverArt`，开关变更自动失效 | `core/artwork/reader_mediafile.go:55-61` |
 | 缩放后的图片有独立的缓存键，包含尺寸和质量参数 | `core/artwork/reader_resized.go:63-69` |
 | `lastUpdate` 取多个时间戳的最大值，包括图片文件的更新时间 | `reader_album.go:57-60`、`reader_artist.go:84-97` |
 
-### 6.3 降级路径结论
+### 6.3 外部来源配置驱动结论
+
+| 结论 | 代码依据 |
+|------|----------|
+| Agent 优先级完全由 `conf.Server.Agents` 配置字符串的顺序决定 | `core/agents/agents.go:71` |
+| `LocalAgent` 始终被追加到 Agent 列表末尾，即使配置中没有 | `core/agents/agents.go:74-77` |
+| 配置为空时，仅使用 `LocalAgent` | `core/agents/agents.go:60-62` |
+| 未知的 Agent 名称会被静默忽略，仅记录 Debug 日志 | `core/agents/agents.go:92-94` |
+| Agent 配置变更会导致专辑和艺术家缓存自动失效 | `reader_album.go:70-75`、`reader_artist.go:105-109` |
+
+### 6.4 降级路径结论
 
 | 结论 | 代码依据 |
 |------|----------|
@@ -984,13 +1091,11 @@ if err != nil || resized == nil {
 | `GetOrPlaceholder()` 会捕获 `ErrUnavailable` 并返回占位图，`Get()` 不会 | `core/artwork/artwork.go:44-58` |
 | Agent 调用是静默降级的，单个失败仅记录 Trace 日志 | `core/agents/agents.go:335` |
 | 艺术家图片有 DB 缓存，首次同步获取，后续从缓存读取 | `core/external/provider.go:373-402` |
-| 专辑图片无 DB 缓存，每次都同步调用 Agent | `core/external/provider.go:404-441` |
-| 媒体文件封面会根据专辑碟数回退到光碟或专辑封面 | `core/artwork/reader_mediafile.go:76-80` |
+| 媒体文件封面的回退是递归的，会进入光碟/专辑的完整降级链 | `core/artwork/reader_mediafile.go:76-80` |
 | 图片缩放失败时会降级返回原图 | `core/artwork/reader_resized.go:90-96` |
 | HTTP 请求超时时间为 5 秒 | `core/artwork/sources.go:213` |
-| 播放列表 HTTP 外部封面需 `EnableM3UExternalAlbumArt = true` | `core/artwork/reader_playlist.go:97-98` |
 
-### 6.4 设计权衡结论
+### 6.5 设计权衡结论
 
 | 决策 | 优点 | 缺点 |
 |------|------|------|
@@ -998,9 +1103,8 @@ if err != nil || resized == nil {
 | Agent 失败静默降级 | 单个服务不可用不影响整体功能 | 问题排查困难，需开启 Trace 日志 |
 | 内嵌封面两次尝试（taglib + ffmpeg） | 兼容性好 | 开销较大，某些场景下重复工作 |
 | 配置变更通过哈希使缓存失效 | 无需手动清理缓存 | 配置微小变化也会导致全量缓存失效 |
-| 播放列表永不失败 | 用户体验好 | 可能掩盖真实问题 |
-| Agent 配置自动追加 local | 确保始终有可用的 Agent | 用户可能未意识到 local 始终启用 |
-| 媒体文件封面无配置 | 逻辑简单，不易出错 | 灵活性较低 |
+| 播放列表占位图忽略 Open 错误 | 代码简洁 | 如果构建出错可能返回 ErrUnavailable |
+| 媒体文件封面递归回退 | 逻辑统一，避免重复代码 | 调用链较深，调试困难 |
 
 ---
 
@@ -1010,11 +1114,15 @@ if err != nil || resized == nil {
 |------|----------|------|
 | 核心调度器 selectImageReader | `core/artwork/sources.go` | 27-42 |
 | sourceFunc 类型定义 | `core/artwork/sources.go` | 44 |
+| 媒体文件封面 Reader | `core/artwork/reader_mediafile.go` | 66-81 |
+| 媒体文件 CoverArtID 判断 | `model/mediafile.go` | 117-124 |
 | 专辑优先级构建 | `core/artwork/reader_album.go` | 86-104 |
 | 艺术家优先级构建 | `core/artwork/reader_artist.go` | 127-145 |
-| 媒体文件优先级构建 | `core/artwork/reader_mediafile.go` | 66-82 |
 | 光碟优先级构建（含专辑回退） | `core/artwork/reader_disc.go` | 129-158 |
 | 播放列表固定优先级链 | `core/artwork/reader_playlist.go` | 68-76 |
+| 播放列表 HTTP 图片开关 | `core/artwork/reader_playlist.go` | 96-100 |
+| 播放列表自动拼图失败处理 | `core/artwork/reader_playlist.go` | 187-195 |
+| 占位图实现 | `core/artwork/sources.go` | 184-189 |
 | 基础缓存键定义 | `core/artwork/image_cache.go` | 16-28 |
 | 专辑缓存键 | `core/artwork/reader_album.go` | 64-76 |
 | 艺术家缓存键 | `core/artwork/reader_artist.go` | 103-111 |
@@ -1022,8 +1130,7 @@ if err != nil || resized == nil {
 | 缩放缓存键 | `core/artwork/reader_resized.go` | 63-69 |
 | GetOrPlaceholder 占位图逻辑 | `core/artwork/artwork.go` | 44-58 |
 | 外部图片 HTTP 客户端 | `core/artwork/sources.go` | 212-225 |
+| Agent 列表构建 | `core/agents/agents.go` | 58-97 |
 | Agent 聚合器核心循环 | `core/agents/agents.go` | 322-345 |
-| Agent 列表构建（含 local 自动追加） | `core/agents/agents.go` | 58-97 |
 | 艺术家图片获取（含缓存） | `core/external/provider.go` | 373-402 |
-| 专辑图片获取（无缓存） | `core/external/provider.go` | 404-441 |
-| 默认配置值 | `conf/configuration.go` | 766-772 |
+| 默认配置值 | `conf/configuration.go` | 750-772 |
