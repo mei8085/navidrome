@@ -682,7 +682,7 @@ func (m *Manager) unloadPlugin(name string) error {
 
 #### 4.3.3 TaskQueue 任务状态迁移与持久化恢复
 
-TaskQueue 是唯一拥有 SQLite 持久化的模块，支持崩溃/重启后的任务状态恢复。其状态迁移机制如下：
+TaskQueue 和 KVStore 是两个使用 SQLite 持久化的模块。TaskQueue 支持崩溃/重启后的任务状态恢复，其状态迁移机制如下：
 
 **任务状态定义**：
 - `pending` - 待执行，等待 worker 取出
@@ -691,49 +691,77 @@ TaskQueue 是唯一拥有 SQLite 持久化的模块，支持崩溃/重启后的�
 - `failed` - 重试耗尽后标记为失败
 - `cancelled` - 已取消
 
-**创建队列时的崩溃恢复** (`host_taskqueue.go:234-241`）
+**三条 running → pending 路径的精确语义**
+
+TaskQueue 有三种场景会将 `running` 状态的任务重置回 `pending`，它们的触发时机和重试计数处理各不相同：
+
+| 场景 | 触发时机 | 重试计数处理 | 代码位置 |
+|-----|---------|-------------|---------|
+| **路径1：崩溃恢复** | CreateQueue 创建队列时 | ❌ **不回退** attempt | `host_taskqueue.go:234-241` |
+| **路径2：优雅关闭** | Close 关闭服务时 | ❌ **不回退** attempt | `host_taskqueue.go:581-588` |
+| **路径3：执行中断回滚** | shutdown/context 取消时 | ✅ **回退** attempt（减 1） | `host_taskqueue.go:490-498` |
+
+**路径1：崩溃恢复**
 
 ```go
-// CreateQueue 时重置上次崩溃遗留的 running 状态任务为 pending
+// CreateQueue 时扫描并重置上次崩溃遗留的 running 任务为 pending
+// 注意：只修改 status，不修改 attempt 字段
 _, err = s.db.ExecContext(ctx, `
     UPDATE tasks SET status = ?, updated_at = ? WHERE queue_name = ? AND status = ?
 `, taskStatusPending, now, name, taskStatusRunning)
 ```
 
-> 这是针对上次进程异常退出（未优雅关闭）的场景：上次运行中处于 `running` 状态的任务，在重启创建队列时被重置为 `pending`，重新进入待执行队列。
+> 场景：上次进程异常退出（如 OOM kill、断电），未执行 Close。重启后插件重新调用 `CreateQueue` 时，将上次遗留的 `running` 任务重置为 `pending`。
+>
+> 重试计数：由于 dequeue 时已 `attempt = attempt + 1`，崩溃后无法回滚，因此**这次已执行的尝试会计入重试次数**。
 
-**优雅关闭时的状态重置** (`host_taskqueue.go:581-588`）
+**路径2：优雅关闭重置**
 
 ```go
-// Close 时主动将当前 running 任务重置为 pending，供下次启动重新调度
-if _, err := s.db.Exec(`UPDATE tasks SET status = ?, updated_at = ? WHERE status = ?`, taskStatusPending, now, taskStatusRunning); err != nil {
+// Close 时主动将当前所有 running 任务重置为 pending
+// 注意：只修改 status，不修改 attempt 字段
+if _, err := s.db.Exec(`UPDATE tasks SET status = ?, updated_at = ? WHERE status = ?`,
+    taskStatusPending, now, taskStatusRunning); err != nil {
     log.Error("Failed to reset running tasks on shutdown", "plugin", s.pluginName, err)
 }
 ```
 
-**执行中断时的状态回滚** (`host_taskqueue.go:490-498`）
+> 场景：插件被卸载、禁用或宿主优雅停机，执行 Close 方法。
+>
+> 重试计数：与崩溃恢复相同，**已递增的 attempt 不会回退**，下次执行时重试次数已消耗一次。
+
+**路径3：执行中断回滚**
 
 ```go
-// shutdown 或 context 取消时，回滚 running 任务为 pending，并将 attempt 计数减 1（不消耗重试次数）
+// 任务执行过程中检测到 context 取消（如 shutdown），回滚该任务
+// 注意：同时将 attempt 减 1，回退重试计数
 func (s *taskQueueServiceImpl) revertTaskToPending(taskID string) {
+    now := time.Now().UnixMilli()
     _, err := s.db.Exec(`UPDATE tasks SET status = ?, attempt = MAX(attempt - 1, 0), updated_at = ? WHERE id = ? AND status = ?`,
         taskStatusPending, now, taskID, taskStatusRunning)
 }
 ```
 
+> 场景：任务已被 dequeue（attempt 已加 1）并正在执行，但此时触发了 shutdown 或 context 取消。
+>
+> 重试计数：**主动将 attempt 减 1**，确保这次中断的执行不消耗重试次数，下次调度时从原计数继续。
+
 **完整状态迁移图**：
 ```
-        Enqueue          Dequeue          Success
-pending ────────→ running ────────→ completed
-          ↑          │
-          │          │ Failure (within retries)
-          │          └───────────→ pending (with backoff)
-          │
-          │ Failure (retries exhausted)
-          └───────────→ failed
+                       Dequeue (attempt+1)
+        Enqueue        ┌───────────┐         Success
+pending ────────→      │  running  │  ───────────→ completed
+   ↑       ┌───────────┴───────────┴───────┐
+   │       │                                │
+   │       │ 执行失败 (within retries)      │ 执行失败 (retries exhausted)
+   │       └──────→ pending (with backoff)  └──────→ failed
+   │
+   │ 三条 running → pending 路径：
+   ├─ 崩溃恢复: attempt 不变 (重试计数已消耗)
+   ├─ 优雅关闭: attempt 不变 (重试计数已消耗)
+   └─ 中断回滚: attempt - 1  (重试计数未消耗)
 
-Shutdown/Crash: running → pending (重置重试计数)
-Cancel:     pending → cancelled
+Cancel: pending → cancelled
 ```
 
 #### 4.3.4 WebSocket 连接卸载清理（无持久化恢复）
@@ -793,16 +821,40 @@ func (s *schedulerServiceImpl) Close() error {
 | **Scheduler** | ❌ 无 | 停止 timer/移除调度 | ❌ 需重新注册 | 调度是内存态的，无状态 |
 | **Cache** | ❌ 内存 | 清空缓存 | ❌ 数据丢失 | 纯内存缓存，无持久化 |
 
-#### 4.3.6 KVStore 清理
+#### 4.3.6 KVStore 持久化存储与清理
+
+KVStore 是第二个使用 SQLite 持久化的模块，每个插件拥有独立的数据库文件（`<dataDir>/plugins/<pluginName>/kvstore.db`），支持键值对的 CRUD 和 TTL 过期自动清理。
+
+**存储结构** (`host_kvstore.go:311-325`）
 
 ```go
-// host_kvstore.go:369-375
-func (s *kvstoreServiceImpl) Close() error {
-    s.cancel()
-    s.wg.Wait()
-    return s.db.Close()
+// 每个插件独立 SQLite 数据库，包含 kv 表
+func createKVStoreSchema(db *sql.DB) error {
+    _, err := db.Exec(`
+        CREATE TABLE IF NOT EXISTS kv (
+            key TEXT PRIMARY KEY,
+            value BLOB NOT NULL,
+            expires_at DATETIME,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    `)
+    return err
 }
 ```
+
+**卸载清理** (`host_kvstore.go:369-375`）
+
+```go
+// Close 时仅关闭数据库连接，数据保留在磁盘上
+func (s *kvstoreServiceImpl) Close() error {
+    s.cancel()       // 停止后台清理 goroutine
+    s.wg.Wait()      // 等待 goroutine 退出
+    return s.db.Close()  // 关闭数据库连接
+}
+```
+
+> **持久化特性**：KVStore 的数据会永久保留在磁盘上，插件重启后重新打开数据库即可访问所有历史数据。只有插件被彻底删除时，其数据目录才会被清理。
 
 #### 4.3.7 Cache 清理
 
