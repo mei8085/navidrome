@@ -871,10 +871,22 @@ selectImageReader()  ── 按顺序尝试 sourceFunc 列表
                                                     └─► 返回艺术家占位图
 ```
 
-**外部来源缓存机制**（`core/external/provider.go:373-402`）：
-- 首次调用：同步调用 Agent 获取 URL，保存到 `artist.LargeImageUrl`
-- 后续调用：直接从 DB 读取 URL，过期后后台异步刷新
-- 过期时间：`conf.Server.DevArtistInfoTimeToLive`（默认 7 天）
+**外部来源缓存与落盘机制**（`core/external/provider.go:373-402`）：
+
+**艺术家图片（ArtistImage）**：
+- DB 中无缓存 URL 时：同步调用 `callGetImage()` 获取 URL，**仅更新内存结构体，不写入数据库**
+- DB 中有缓存 URL 时：直接返回 URL
+- 过期触发：`time.Since(ExternalInfoUpdatedAt) > DevArtistInfoTimeToLive` 时，入队列**后台异步刷新**
+- **落盘时机**：仅在 `populateArtistInfo()` 中写入 DB，该方法由 `UpdateArtistInfo()` 或后台刷新队列调用
+
+**专辑图片（AlbumImage）**：
+- **无缓存机制**：每次调用都实时从 Agent 获取，不检查 DB 缓存
+- **不落盘**：获取到的 URL 直接返回，不写入数据库
+- 落盘时机：仅在 `populateAlbumInfo()` 中写入 DB
+
+**缓存时效默认值**（`consts/consts.go:61-62`）：
+- `DevArtistInfoTimeToLive`：**24 小时**
+- `DevAlbumInfoTimeToLive`：**7 天**
 
 ---
 
