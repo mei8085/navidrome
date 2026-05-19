@@ -349,10 +349,22 @@ func (s *SQLStore) WithTxImmediate(block func(tx model.DataStore) error, scope .
 | Delete (playlist) | 无事务 | 单条 DELETE + 文件系统操作（非事务） |
 | RemoveTracks | `WithTx` | 删除 + renumber 需要原子性 |
 | ReorderTrack | `WithTx` | 四条 UPDATE 必须原子执行 |
-| AddTracks | 无事务 | 单条 INSERT（分块时多条，但无状态依赖） |
+| **AddTracks** | **无事务** | **SELECT max(id) + 分块 INSERT，完全无事务，存在并发冲突风险** |
 | AddAlbums/AddArtists/AddDiscs | 无事务 | 先查询再插入，独立操作无外层事务 |
 | **Native 批量添加四类来源** | **无外层事务** | **四类来源顺序执行，部分失败不回滚** |
 | GC/removeOrphans | `WithTx` (外层) | 整个GC过程在一个大事务中 |
+
+#### 5.2.1 Add 操作的并发风险
+
+`AddTracks` 内部的 `SELECT max(id)` 和 `INSERT` 之间没有事务保护：
+```
+时间点 | 请求A | 请求B
+-------|-------|-------
+  T1   | SELECT max(id) → 100 |
+  T2   |       | SELECT max(id) → 100
+  T3   | INSERT 从 101 开始 |
+  T4   |       | INSERT 也从 101 开始 → 唯一约束违反！
+```
 
 ### 5.3 事务嵌套支持
 
@@ -459,14 +471,72 @@ func (r *playlistTrackRepository) AddDiscs(discs []model.DiscID) (int, error) {
 3. ArtistIds → 同上排序
 4. Discs → 同上排序
 
-### 6.3 事务边界分析
+### 6.3 追加写入的实际 SQL 执行路径与事务边界
 
-**核心问题**：四类添加操作**没有外层事务包裹**，每个 `AddXxx` 调用都是独立的。
+#### 6.3.1 完整执行路径
 
-各方法的事务边界：
+`Add` 方法的完整执行路径如下（`persistence/playlist_track_repository.go:143-159`）：
 
 ```go
-// core/playlists/playlists.go:246-272
+func (r *playlistTrackRepository) Add(mediaFileIds []string) (int, error) {
+    // Step 1: 查询当前最大位置ID
+    sq := r.newSelect().Columns("max(id) as max").Where(Eq{"playlist_id": r.playlistId})
+    var res struct{ Max sql.NullInt32 }
+    err := r.queryOne(sq, &res)  // 第一条SQL: SELECT max(id)
+    if err != nil {
+        return 0, err
+    }
+
+    // Step 2: 分块插入，每块200条
+    return len(mediaFileIds), r.playlistRepo.addTracks(r.playlistId, int(res.Max.Int32+1), mediaFileIds)
+}
+```
+
+`addTracks` 内部实现（`persistence/playlist_repository.go:229-246`）：
+
+```go
+func (r *playlistRepository) addTracks(playlistId string, startingPos int, mediaFileIds []string) error {
+    pos := startingPos
+    for chunk := range slices.Chunk(mediaFileIds, 200) {
+        ins := Insert("playlist_tracks").Columns("playlist_id", "media_file_id", "id")
+        for _, t := range chunk {
+            ins = ins.Values(playlistId, t, pos)
+            pos++
+        }
+        _, err := r.executeSQL(ins)  // 每块一条独立的 INSERT SQL
+        if err != nil {
+            return err  // 失败立即返回，前面已插入的块不会回滚
+        }
+    }
+    return r.refreshCounters(&model.Playlist{ID: playlistId})  // 最后一条SQL: UPDATE 统计信息
+}
+```
+
+#### 6.3.2 真实事务边界分析
+
+**关键发现：完全没有事务包裹！**
+
+| 操作 | SQL 语句 | 事务状态 |
+|------|----------|----------|
+| 查询 max(id) | `SELECT max(id) FROM playlist_tracks WHERE playlist_id = ?` | 自动提交 |
+| 插入第1块 | `INSERT INTO playlist_tracks ...` (200条) | 自动提交 |
+| 插入第2块 | `INSERT INTO playlist_tracks ...` (200条) | 自动提交 |
+| ... | ... | ... |
+| 刷新统计 | `UPDATE playlist SET duration=?, size=?, song_count=? WHERE id=?` | 自动提交 |
+
+**并发安全问题：**
+
+`SELECT max(id)` 和后续 `INSERT` 之间没有事务，也没有锁：
+1. 请求A：`SELECT max(id)` → 得到 100
+2. 请求B：`SELECT max(id)` → 也得到 100
+3. 请求A：`INSERT` 从 101 开始
+4. 请求B：`INSERT` 也从 101 开始 → **唯一约束违反！**
+
+#### 6.3.3 Service 层的事务边界
+
+四类添加操作在 Service 层也没有外层事务（`core/playlists/playlists.go:246-272`）：
+
+```go
 func (s *playlists) AddTracks(ctx context.Context, playlistID string, ids []string) (int, error) {
     if _, err := s.checkTracksEditable(ctx, playlistID); err != nil {
         return 0, err
@@ -483,19 +553,17 @@ func (s *playlists) AddAlbums(ctx context.Context, playlistID string, albumIds [
 // AddArtists 和 AddDiscs 同理
 ```
 
-**Add 方法内部**（`persistence/playlist_track_repository.go:143-159`）：
-```go
-func (r *playlistTrackRepository) Add(mediaFileIds []string) (int, error) {
-    // 查询 max(id) - 单条SQL
-    sq := r.newSelect().Columns("max(id) as max").Where(Eq{"playlist_id": r.playlistId})
-    // ...
-    
-    // 分块插入 - 多条SQL但无事务包裹
-    return len(mediaFileIds), r.playlistRepo.addTracks(r.playlistId, int(res.Max.Int32+1), mediaFileIds)
-}
-```
-
 ### 6.4 部分成功风险
+
+#### 6.4.1 单 Add 调用内的部分成功
+
+**风险场景**：一次添加 500 首歌，分 3 块插入
+1. 第1块（200条）：成功提交
+2. 第2块（200条）：成功提交
+3. 第3块（100条）：失败（如数据库连接断开）
+4. 结果：前 400 首歌已永久添加，后 100 首丢失
+
+#### 6.4.2 Native 批量添加四类来源的部分成功
 
 **风险场景**：
 1. 请求同时包含 `ids: ["track1", "track2"]` 和 `albumIds: ["album1"]`
@@ -670,29 +738,64 @@ func (s *playlists) RemoveTracks(ctx context.Context, playlistID string, trackId
 }
 ```
 
-### 8.4 与重编号的关系
+### 8.4 与重编号的真实关系
 
-**Subsonic 索引的脆弱性**：
+#### 8.4.1 renumber 会改变所有位置ID！
 
-Subsonic 的 `songIndexToRemove` 是基于"播放列表当前顺序"的索引，但这个索引只在**调用时**有效。如果在调用前播放列表被修改过（如其他用户添加/删除歌曲），索引会错位。
+**关键纠正**：之前错误地认为 Native API 的位置ID是稳定的。实际上，`renumber` 方法会**重新分配所有位置ID**！
 
-**示例**：
-1. 用户A看到播放列表：[A, B, C]（索引0,1,2）
-2. 用户B在此时删除了歌曲A
-3. 实际列表变为：[B, C]（位置1,2）
+`renumber` 的核心逻辑（`persistence/playlist_repository.go:389-411`）：
+```go
+func (r *playlistRepository) renumber(id string) error {
+    // Step 1: 将所有ID取反
+    UPDATE playlist_tracks SET id = -id WHERE playlist_id = ? AND id > 0
+    
+    // Step 2: 重新分配从1开始的连续ID
+    WITH new_ids AS (
+        SELECT rowid as rid, ROW_NUMBER() OVER (ORDER BY id DESC) as new_id
+        FROM playlist_tracks WHERE playlist_id = ?
+    )
+    UPDATE playlist_tracks SET id = new_ids.new_id
+    FROM new_ids
+    WHERE playlist_tracks.rowid = new_ids.rid AND playlist_tracks.playlist_id = ?
+}
+```
+
+**结论**：任何触发 renumber 的操作（删除歌曲、孤儿清理）都会导致**所有歌曲的位置ID被重新分配**。
+
+#### 8.4.2 Subsonic 索引的脆弱性
+
+Subsonic 的 `songIndexToRemove` 是基于"播放列表当前顺序"的索引，但这个索引只在**调用时**有效。
+
+**并发风险示例**：
+1. 用户A看到播放列表：[A, B, C]（索引0,1,2，对应位置ID 1,2,3）
+2. 用户B删除了歌曲A → 触发 renumber
+3. renumber 后：[B(1), C(2)]（所有位置ID都变了！）
 4. 用户A发送请求删除索引1（想删B）
 5. 服务端转换：索引1 → 位置ID "2"
 6. 删除位置2 → 实际删除了C，而不是B！
 
-**Native API 的优势**：
+#### 8.4.3 Native API 位置ID的真实风险
 
-Native API 直接使用位置ID（`playlist_tracks.id`），即使列表被修改，只要该位置的歌曲还在，就能正确删除。如果位置已不存在，SQL 的 `WHERE id IN (...)` 只会忽略不存在的ID。
+Native API 直接使用位置ID，但位置ID会被 renumber 改变，所以**同样不稳定**！
+
+**并发风险示例**：
+1. 用户A看到播放列表：[A(1), B(2), C(3)]
+2. 用户B删除了歌曲A → 触发 renumber
+3. renumber 后：[B(1), C(2)]（B的位置ID从2变成1，C从3变成2）
+4. 用户A发送请求删除 `id=2`（想删B）
+5. 此时位置ID 2 是C → 删除了C，而不是B！
+
+**更隐蔽的风险**：
+- 如果 renumber 发生在用户获取列表和发送删除请求之间
+- 用户想删的歌曲可能已经移动到其他位置ID
+- 结果：要么删除了错误的歌曲，要么返回"not found"（如果位置ID已不存在）
 
 ### 8.5 批量删除的顺序问题
 
 **Subsonic 批量删除多个索引**：
 
-假设列表：[A, B, C, D, E]（索引0-4）
+假设列表：[A, B, C, D, E]（索引0-4，位置ID 1-5）
 请求删除索引：[1, 3]（想删B和D）
 
 ```go
@@ -702,7 +805,7 @@ idxToRemove = [1, 3]
 ```
 
 这是正确的，因为：
-- 删除操作是基于**原始位置**的
+- 删除操作是基于**操作前**的原始位置
 - `IN` 操作不关心参数顺序
 - 删除后 renumber 会修复间隙
 
@@ -715,9 +818,15 @@ idxToRemove = [1, 3]
 |------|-------------|------------|
 | 参数类型 | 0-based 索引数组 | 1-based 位置ID字符串数组 |
 | 转换层 | Service 层 `idx+1` 转换 | 无转换，直接传递 |
-| 并发安全性 | 低（索引可能错位） | 高（位置ID稳定） |
-| 与 renumber 关系 | 依赖 renumber 保持索引连续 | 不依赖，直接操作位置ID |
+| **并发安全性** | **低（索引可能错位）** | **同样低（位置ID会被renumber改变）** |
+| 与 renumber 关系 | 依赖 renumber 保持索引连续 | 受 renumber 直接影响，位置ID动态变化 |
 | 批量删除顺序 | 不影响结果 | 不影响结果 |
+| 风险表现 | 索引错位删除错误歌曲 | 位置ID重分配删除错误歌曲 |
+
+**重要结论**：
+- Subsonic 和 Native API 在并发场景下都不安全
+- 根本原因：`renumber` 会动态改变所有位置ID
+- 客户端必须基于最新的列表状态进行操作，或者使用更稳定的标识（如 `media_file_id`）进行删除
 
 ---
 
@@ -875,6 +984,25 @@ func (r *playlistRepository) renumber(id string) error {
 - 取反后 `ORDER BY id DESC` 等价于原顺序的 `ORDER BY id ASC`
 - CTE 先完全计算再执行 UPDATE，避免自引用问题
 - 使用 SQLite 的 `rowid` 作为关联键，不依赖业务字段
+
+#### 9.4.1 renumber 的副作用：所有位置ID被重新分配
+
+**重要提示**：renumber 虽然解决了编号不连续的问题，但带来了严重的副作用——**所有歌曲的位置ID都会被重新分配**！
+
+触发 renumber 的场景包括：
+1. 用户主动删除歌曲（`Delete` 内部调用）
+2. 孤儿清理（GC 过程中调用）
+3. `DeleteAll` 清空播放列表
+
+**对客户端的影响**：
+- 客户端缓存的位置ID在 renumber 后全部失效
+- 基于旧位置ID的删除请求可能删除错误的歌曲
+- 客户端必须在每次操作前重新获取播放列表
+
+**设计权衡**：
+- 简单的设计选择了简单的 renumber 算法
+- 牺牲了并发安全性，换取实现简单
+- 假设播放列表很少并发修改的概率较低（单用户场景）
 
 ---
 
