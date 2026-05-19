@@ -394,24 +394,130 @@ func checkShareError(ctx context.Context, w http.ResponseWriter, err error, id s
 
 **核心文件**: `server/public/handle_images.go:17-88`
 
+#### 4.4.1 令牌解析的回退逻辑
+
 ```go
 func decodeArtworkID(tokenString string) (model.ArtworkID, error) {
-    token, err := auth.TokenAuth.Decode(tokenString)  // 仅解码，不验证过期
+    token, err := auth.TokenAuth.Decode(tokenString)
     if err != nil {
         return model.ArtworkID{}, err
+    }
+    if token == nil {
+        return model.ArtworkID{}, errors.New("unauthorized")
     }
     c := auth.ClaimsFromToken(token)
     if c.ID == "" {
         return model.ArtworkID{}, errors.New("required claim \"id\" not found")
     }
-    return model.ParseArtworkID(c.ID)
+    
+    // 第一次尝试：直接解析为 ArtworkID（如 "al-123"、"ar-456"）
+    artID, err := model.ParseArtworkID(c.ID)
+    if err == nil {
+        return artID, nil
+    }
+    
+    // 🔴 回退逻辑：如果解析失败，尝试作为媒体文件ID处理
+    // Try to default to mediafile artworkId (if used with a mediafileShare token)
+    return model.ParseArtworkID("mf-" + c.ID)
 }
 ```
 
-**访问控制特点**:
-- 令牌验证：仅验证签名，**不检查过期时间**
-- 权限：只能访问令牌中 `id` 声明指定的资源
-- 缓存：响应头设置 `Cache-Control: public, max-age=315360000`（10年）
+**回退逻辑说明**：
+- **第一次尝试**：将 `c.ID` 直接解析为 ArtworkID（格式如 `al-{专辑ID}`、`ar-{艺术家ID}`、`mf-{媒体文件ID}`）
+- **回退尝试**：如果解析失败，自动添加 `mf-` 前缀，尝试作为媒体文件的封面ID解析
+- **设计目的**：兼容分享流令牌（mediafileShare token），使分享流中的媒体文件ID可以直接用于访问其封面
+
+> **重要边界**：回退逻辑意味着**任何包含有效 `ID` 声明的 JWT 令牌都可能被用于访问图片**，即使该令牌原本是为其他目的（如分享流）签发的。
+
+---
+
+#### 4.4.2 图片令牌的生成方式
+
+**核心文件**: `core/publicurl/publicurl.go:18-28`
+
+```go
+func ImageURL(req *http.Request, artID model.ArtworkID, size int) string {
+    token, _ := auth.CreatePublicToken(auth.Claims{ID: artID.String()})
+    uri := path.Join(consts.URLPathPublicImages, token)
+    // ... 构建完整 URL
+}
+```
+
+**生成方式**：使用 `auth.CreatePublicToken()` 生成
+
+```go
+// core/auth/auth.go:48-52
+func CreatePublicToken(claims Claims) (string, error) {
+    claims.Issuer = consts.JWTIssuer
+    _, token, err := TokenAuth.Encode(claims.ToMap())
+    return token, err  // ❌ 不设置 ExpiresAt！
+}
+```
+
+**令牌特征**：
+- ✅ 设置 `Issuer`（签发者）
+- ✅ 包含 `ID` 声明（资源标识）
+- ❌ **不设置 `ExpiresAt`（过期时间）**
+- ❌ 不设置 `IssuedAt`（签发时间）
+
+---
+
+#### 4.4.3 过期检查方式
+
+**验证方法**：使用 `auth.TokenAuth.Decode()` 而非 `auth.Validate()`
+
+```go
+// 图片路径：仅解码，不验证过期
+token, err := auth.TokenAuth.Decode(tokenString)
+
+// 对比：分享流路径：完整验证（包括过期）
+c, err := auth.Validate(tokenString)
+```
+
+**关键区别**：
+
+| 方法 | 验证签名 | 检查过期 | 适用场景 |
+|------|---------|---------|---------|
+| `TokenAuth.Decode()` | ✅ | ❌ | 公开图片 |
+| `auth.Validate()` | ✅ | ✅ | 分享流、下载、API认证 |
+
+> **设计意图**：图片资源设置了超长缓存（`Cache-Control: public, max-age=315360000`，约10年），因此不检查过期，避免缓存的图片URL失效。
+
+---
+
+#### 4.4.4 访问控制边界
+
+**权限矩阵**：
+
+| 条件 | 结果 | 说明 |
+|------|------|------|
+| 签名无效 | ❌ 400 Bad Request | 令牌被篡改 |
+| `ID` 声明缺失 | ❌ 400 Bad Request | 令牌格式错误 |
+| 资源不存在 | ❌ 404 Not Found | 艺术品ID无效 |
+| 令牌已过期（如有exp） | ✅ 正常访问 | Decode不检查过期 |
+| 签名有效 + 资源存在 | ✅ 正常访问 | 永久有效 |
+
+**访问控制边界总结**：
+1. **无过期限制**：只要签名有效，永久可访问
+2. **无分享关联**：图片令牌独立于分享记录，分享过期后图片仍可访问
+3. **无用户关联**：不需要登录，不验证用户身份
+4. **回退风险**：分享流令牌可被重用于访问对应媒体文件的封面
+
+---
+
+#### 4.4.5 与其他公开路由的异同对照
+
+| 特性 | 公开图片 (`/img/{id}`) | 分享流 (`/s/{id}`) | 分享页面 (`/{id}`) | 公开下载 (`/d/{id}`) |
+|------|----------------------|-------------------|-------------------|-------------------|
+| 路由注册条件 | 始终可用（不受 `EnableSharing` 影响） | `EnableSharing=true` | `EnableSharing=true` | `EnableSharing && EnableDownloads` |
+| 令牌验证方法 | `TokenAuth.Decode()` | `auth.Validate()` | 无JWT（分享ID） | 无JWT（分享ID） |
+| 过期检查 | ❌ 不检查 | ✅ 检查（JWT过期+分享过期） | ✅ 检查（分享记录过期） | ✅ 检查（分享记录过期） |
+| 分享记录检查 | ❌ 不检查 | ✅ 检查分享是否存在/过期 | ✅ 检查分享是否存在/过期 | ✅ 检查分享是否存在/过期 |
+| 令牌回退逻辑 | ✅ 有（`mf-` 前缀回退） | ❌ 无 | ❌ 无 | ❌ 无 |
+| 缓存策略 | 超长缓存（10年） | 不缓存 | 不缓存 | 不缓存 |
+| 可被其他令牌复用 | ✅ 分享流令牌可访问封面 | ❌ 仅流令牌可用 | ❌ 仅分享ID可用 | ❌ 仅分享ID可用 |
+
+---
 
 ### 4.5 公开流媒体访问 (`/share/s/{id}`)
 
@@ -781,7 +887,7 @@ Subsonic API **不使用** `Authenticator`，有自己独立的认证逻辑，�
 
 #### 10.2.4 公开路由路径
 
-**代码依据**: `server/public/handle_streams.go:84`, `server/public/handle_shares.go`
+**代码依据**: `server/public/handle_streams.go:84`, `server/public/handle_shares.go`, `server/public/handle_images.go:70-88`
 
 ```
 JWTVerifier（预解析但不使用）→ URLParamsMiddleware → 各处理器自行验证
@@ -795,6 +901,11 @@ JWTVerifier（预解析但不使用）→ URLParamsMiddleware → 各处理器�
 | 分享页面（`/{id}`） | `share.Load()` 检查 `ExpiresAt` | 分享过期 → 410 Gone |
 | 转码流 | `parseTranscodeParams()` | 令牌过期 → 返回错误 |
 | 公开图片（`/img/{id}`） | ❌ 不检查过期 | 只要签名有效就永久可访问 |
+
+> **特别注意**：公开图片路径的 `decodeArtworkID` 函数存在**回退逻辑**：
+> - 先尝试直接解析 `c.ID` 为 ArtworkID
+> - 如失败，自动添加 `mf-` 前缀重试
+> - 这意味着分享流令牌（包含媒体文件ID）可被重用于访问对应媒体文件的封面
 
 ---
 
@@ -822,7 +933,57 @@ JWTVerifier（预解析但不使用）→ URLParamsMiddleware → 各处理器�
 
 > **统一结论**: 公开路由经过完整的全局中间件链，因此公开请求上下文中包含 `RequestID`、`RealIP`、`ClientUniqueId` 等字段。但公开路由不经过认证中间件，因此不强制用户登录。
 
-### 10.5 公开请求中 ClientUniqueId 的真实来源
+### 10.5 公开图片路径的权限边界总结
+
+**代码依据**: `server/public/handle_images.go:70-88`, `core/publicurl/publicurl.go:18-28`
+
+#### 10.5.1 令牌解析的回退逻辑
+
+公开图片路径是唯一存在**资源标识回退逻辑**的公开路由：
+
+```go
+// 第一次尝试：直接解析为 ArtworkID
+artID, err := model.ParseArtworkID(c.ID)
+if err == nil {
+    return artID, nil
+}
+
+// 回退尝试：添加 mf- 前缀后重试
+return model.ParseArtworkID("mf-" + c.ID)
+```
+
+**回退逻辑的影响：
+- ✅ 设计目的：使分享流令牌（mediafileShare token）可直接用于访问媒体文件的封面
+- ⚠️ 安全边界：任何包含有效 `ID` 声明的 JWT 令牌（无论签发目的）都可能被用于访问图片
+- ❗ 注意：这是有意的设计选择，而非漏洞
+
+---
+
+#### 10.5.2 生成方式与过期检查的组合边界
+
+| 环节 | 行为 | 访问控制影响 |
+|------|------|-------------|
+| 令牌生成 | `CreatePublicToken()` **不设置过期时间 | 令牌本身无过期限制 |
+| 令牌验证 | `TokenAuth.Decode()` **不检查过期 | 即使令牌包含 `exp` 声明也不会被拒绝 |
+| 缓存策略 | `Cache-Control: public, max-age=315360000`（10年） | 图片URL可被浏览器和CDN长期缓存 |
+
+**组合后的访问控制边界**：
+> 🔴 **图片令牌一经签发，**永久有效**，无法通过过期机制撤销。只能通过删除资源本身或重新生成JWT密钥来撤销访问。
+
+---
+
+#### 10.5.3 与其他公开路由的核心差异
+
+| 维度 | 公开图片 | 分享流/下载 | 分享页面 |
+|------|---------|------------|---------|
+| 路由依赖 | 无（始终可用） | `EnableSharing` | `EnableSharing` |
+| 令牌类型 | 专用图片令牌 | 专用分享流令牌 | 无JWT（分享ID） |
+| 过期机制 | ❌ 无 | ✅ JWT过期 + 分享过期 | ✅ 分享记录过期 |
+| 分享关联 | ❌ 独立于分享 | ✅ 依赖分享记录 | ✅ 依赖分享记录 |
+| 撤销方式 | 只能删除资源/换密钥 | 删除/过期分享 | 删除/过期分享 |
+| 令牌复用 | ✅ 分享流令牌可访问封面 | ❌ 仅专用令牌 | ❌ 仅分享ID |
+
+### 10.6 公开请求中 ClientUniqueId 的真实来源
 
 **代码依据**: `server/middlewares.go:92-118`
 
