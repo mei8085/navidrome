@@ -352,8 +352,19 @@ func SongsByArtistTitleWithLyricsFirst(artist, title string) Options {
    - 使用 SQLite 的 `json_tree` 函数解析 JSON 格式的参与者字段
 
 #### 排序优先级（从高到低）
-1. **lyrics 字段降序**: 非空歌词排在前面（SQL 中字符串比较，非空 > 空）
-2. **updated_at 降序**: 更新时间新的排在前面
+**文件位置**: `persistence/mediafile_repository.go:83-93`
+
+`mediaFileRepository` 的 `sortMappings` 中 **没有** 对 `lyrics` 字段的特殊映射，因此 `Sort: "lyrics, updated_at"` 直接生成 SQL：
+
+```sql
+ORDER BY lyrics DESC, updated_at DESC
+```
+
+**排序语义修正**:
+- **不是** 通过 `(lyrics != '[]')` 布尔表达式排序
+- 而是直接对 `lyrics` 列进行**字符串字典序降序**排序
+- 利用 SQLite 字符串比较特性：空歌词 `"[]"` < 有歌词 `"[{...}]"`（因为 `]` 的 ASCII 值 93 < `{` 的 123）
+- 这恰好实现了「有歌词的排在前面」的效果
 
 #### 选取结果
 - **Max: 1** - 只返回排序后的第一条记录
@@ -397,8 +408,12 @@ Navidrome 提供两个 Subsonic API 端点获取歌词，它们的设计目标�
 
 ```go
 func (api *Router) GetLyrics(r *http.Request) (*responses.Subsonic, error) {
-    artist, _ := p.String("artist")
-    title, _ := p.String("title")
+    p := req.Params(r)
+    artist, _ := p.String("artist")   // 从请求参数获取
+    title, _ := p.String("title")     // 从请求参数获取
+    response := newResponse()
+    lyricsResponse := responses.Lyrics{}
+    response.Lyrics = &lyricsResponse
     
     mediaFiles, err := api.ds.MediaFile(r.Context()).GetAll(
         filter.SongsByArtistTitleWithLyricsFirst(artist, title))
@@ -413,6 +428,7 @@ func (api *Router) GetLyrics(r *http.Request) (*responses.Subsonic, error) {
         return response, nil
     }
     
+    // ⚠️  关键：Artist 和 Title 直接使用请求参数，不是从 MediaFile 获取
     lyricsResponse.Artist = artist
     lyricsResponse.Title = title
     
@@ -436,12 +452,20 @@ type Lyrics struct {
 }
 ```
 
+**字段取值来源（重点修正）**:
+- **Artist**: 直接来自 `?artist=` 请求参数，**不是** 从数据库 `MediaFile.Artist` 获取
+- **Title**: 直接来自 `?title=` 请求参数，**不是** 从数据库 `MediaFile.Title` 获取
+- **Value**: 从 `structuredLyrics[0].Line` 拼接纯文本
+
+**潜在问题**: 如果请求参数与实际数据库中的元数据不一致，响应会返回用户传入的值而非实际值。
+
 **信息丢失点**:
 1. **多条歌词**: 只取 `structuredLyrics[0]`，其他语言/版本被丢弃
 2. **时间轴**: `Line.Start` 字段完全被忽略
 3. **语言**: `Lang` 字段丢失
 4. **同步标记**: `Synced` 字段丢失
 5. **Offset**: 偏移量丢失
+6. **真实元数据**: 不使用数据库中实际的 Artist/Title
 
 ### 5.3 GetLyricsBySongId 接口实现
 
@@ -538,9 +562,109 @@ GetLyricsBySongId 路径:
 
 ---
 
-## 6. 代码架构总结
+## 6. 三层决策链完整整合结论
 
-### 6.1 模块职责划分
+### 6.1 决策链全景图
+
+```
+用户请求
+    ↓
+┌─────────────────────────────────────────┐
+│ 第一层：选歌决策 (Song Selection)        │
+│ ┌─────────────────────────────────────┐ │
+│ │ 输入: artist, title (请求参数)      │ │
+│ │ 过滤: title 精确匹配 + artist 匹配  │ │
+│ │ 排序: lyrics DESC, updated_at DESC  │ │
+│ │ 输出: MediaFile[0] (取第一条)       │ │
+│ └─────────────────────────────────────┘ │
+└─────────────────────────────────────────┘
+    ↓ (MediaFile)
+┌─────────────────────────────────────────┐
+│ 第二层：来源决策 (Source Selection)      │
+│ ┌─────────────────────────────────────┐ │
+│ │ 输入: MediaFile                     │ │
+│ │ 配置: LyricsPriority (如 embedded,.lrc)│ │
+│ │ 策略: 按顺序遍历，先到先得          │ │
+│ │ 中断: len(lyricsList) > 0 立即返回  │ │
+│ │ 输出: LyricList (第一条非空来源)    │ │
+│ └─────────────────────────────────────┘ │
+└─────────────────────────────────────────┘
+    ↓ (LyricList)
+┌─────────────────────────────────────────┐
+│ 第三层：接口返回决策 (API Response)      │
+│ ┌─────────────────────────────────────┐ │
+│ │ 接口: GetLyrics                     │ │
+│ │   • Artist/Title: 请求参数回显      │ │
+│ │   • 歌词: 取 LyricList[0] 纯文本    │ │
+│ │   • 丢失: 时间轴、语言、同步标记    │ │
+│ │                                     │ │
+│ │ 接口: GetLyricsBySongId             │ │
+│ │   • Artist/Title: MediaFile 降级填充 │ │
+│ │   • 歌词: 完整保留 LyricList        │ │
+│ │   • 保留: 所有元数据和时间轴        │ │
+│ └─────────────────────────────────────┘ │
+└─────────────────────────────────────────┘
+    ↓
+API 响应
+```
+
+### 6.2 第一层：选歌决策详解
+
+**触发条件**: 仅 `GetLyrics` 接口需要选歌；`GetLyricsBySongId` 直接通过 ID 定位。
+
+| 决策点 | 规则 | 代码位置 |
+|--------|------|----------|
+| 匹配字段 | `title` 精确匹配，`artist` 通过 `json_tree` 匹配参与者 | `filter/filters.go:111-124` |
+| 排序逻辑 | `lyrics DESC, updated_at DESC` | `filter/filters.go:113` |
+| 排序语义 | 字符串字典序，利用 `"[]"` < `"[{...}]"` 特性 | `persistence/mediafile_repository.go:83-93` |
+| 结果数量 | `Max: 1`，只取第一条 | `filter/filters.go:115` |
+
+### 6.3 第二层：来源决策详解
+
+**两个接口共享同一来源决策逻辑**。
+
+| 决策点 | 规则 | 代码位置 |
+|--------|------|----------|
+| 来源顺序 | 按 `LyricsPriority` 配置逗号分割顺序遍历 | `core/lyrics/lyrics.go:38` |
+| 来源类型 | `embedded` → `.lrc/.txt` → 插件名称 | `core/lyrics/lyrics.go:40-46` |
+| 中断条件 | `len(lyricsList) > 0` 立即返回 | `core/lyrics/lyrics.go:53-55` |
+| 错误处理 | 仅记录日志，继续下一个来源 | `core/lyrics/lyrics.go:49-51` |
+| 最终输出 | 第一个非空来源的 `LyricList` | `core/lyrics/lyrics.go:54` |
+
+### 6.4 第三层：接口返回决策对比
+
+| 决策点 | GetLyrics | GetLyricsBySongId |
+|--------|-----------|-------------------|
+| Artist 取值 | 请求参数 `?artist=` 回显 | 优先 `Lyrics.DisplayArtist`，降级 `MediaFile.Artist` |
+| Title 取值 | 请求参数 `?title=` 回显 | 优先 `Lyrics.DisplayTitle`，降级 `MediaFile.Title` |
+| 歌词条数 | 只取 `LyricList[0]` | 保留全部 `LyricList` |
+| 时间轴信息 | 丢弃，纯文本拼接 | 完整保留 `Line.Start` |
+| 语言信息 | 丢弃 | 保留 `Lang` 字段 |
+| 同步标记 | 丢弃 | 保留 `Synced` 字段 |
+| Offset | 丢弃 | 保留 `Offset` 字段 |
+
+### 6.5 关键核对点
+
+**核对点 1：排序语义**
+- ❌ 错误理解：通过 `(lyrics != '[]')` 布尔表达式排序
+- ✅ 正确理解：直接 `lyrics DESC` 字符串排序，利用 `"[]"` < `"[{...}]"` 特性
+- 验证：`persistence/mediafile_repository.go:83-93` 中无 `lyrics` 的 sortMapping
+
+**核对点 2：旧接口元数据来源**
+- ❌ 错误理解：从查询到的 MediaFile 中获取
+- ✅ 正确理解：直接回显请求参数 `artist` 和 `title`
+- 验证：`server/subsonic/media_retrieval.go:96-97, 120-121`
+
+**核对点 3：三层决策独立性**
+- 选歌决策与来源决策相互独立
+- 选歌只决定使用哪个 MediaFile，来源决策决定该 MediaFile 使用哪个歌词来源
+- 接口返回决策只影响输出格式，不影响数据获取
+
+---
+
+## 7. 代码架构总结
+
+### 7.1 模块职责划分
 
 | 模块 | 职责 | 文件 |
 |------|------|------|
@@ -551,7 +675,7 @@ GetLyricsBySongId 路径:
 | API 层 | Subsonic API 响应构建、元数据补充 | `server/subsonic/helpers.go` |
 | 过滤器 | 同名歌曲选取规则 | `server/subsonic/filter/filters.go` |
 
-### 6.2 设计特点
+### 7.2 设计特点
 
 1. **可扩展的来源系统**: 通过配置字符串动态支持新的来源类型
 2. **统一解析入口**: 所有来源最终都通过 `model.ToLyrics()` 解析
@@ -560,11 +684,12 @@ GetLyricsBySongId 路径:
 5. **元数据降级**: 歌词元数据缺失时自动从媒体文件补充
 6. **双接口设计**: 同时支持传统纯文本接口和现代结构化接口
 
-### 6.3 关键技术决策总结
+### 7.3 关键技术决策总结
 
 | 决策 | 说明 |
 |------|------|
 | **优先级胜出** | 多来源不合并，按配置顺序先到先得 |
-| **歌词优先排序** | 同名歌曲优先选择有歌词的记录 |
-| **信息分层暴露** | 旧接口简化，新接口完整保留全部信息 |
+| **歌词优先排序** | 同名歌曲通过 `lyrics DESC` 字符串排序优先选择有歌词的记录 |
+| **请求参数回显** | 旧接口 `GetLyrics` 的 Artist/Title 直接回显请求参数 |
+| **信息分层暴露** | 旧接口简化输出，新接口完整保留全部信息 |
 | **插件原始文本协议** | 插件只需返回文本，解析逻辑集中处理 |
