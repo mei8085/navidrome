@@ -211,3 +211,263 @@ GetTouchedWithPlaylists() → processPlaylistsInFolder() → ImportFromFolder()
 - `walk_dir_tree.go:21-27`: 仅遍历目标文件夹及其子目录
 - `scanner.go:238-242`: GC 时仅作用于涉及的库
 - 应用场景：文件系统监视器检测到局部变更时触发
+
+## 八、SQLite 落库流程详解
+
+### 8.1 完整调用链（从标签读取到索引写入）
+
+整个 Phase 1 流程分为 **内存处理阶段**（事务外）和 **数据库写入阶段**（事务内），由三个 Pipeline Stage 串行执行：
+
+```
+Stage 1: processFolder (内存处理) → Stage 2: persistChanges (DB写入) → Stage 3: logFolder
+```
+
+#### 阶段 A：内存处理（事务外，`phase_1_folders.go:208-267`）
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  processFolder(entry)                                                    │
+│                                                                          │
+│  1. 从 DB 加载现有轨道 → dbTracks[path]*MediaFile                        │
+│     GetCursor(Filters: folder_id=?)                                      │
+│                                                                          │
+│  2. 对比 FS 与 DB，确定 filesToImport 和 missingTracks                   │
+│     ├─ 全量扫描：所有文件 → filesToImport                                 │
+│     └─ 增量扫描：modTime > dbTrack.UpdatedAt → filesToImport             │
+│        剩余 dbTracks → missingTracks                                     │
+│                                                                          │
+│  3. loadTagsFromFiles() 批量读取元数据（200/批）                          │
+│     ├─ fs.ReadTags(chunk...) → 从文件系统读取标签                        │
+│     ├─ metadata.New() → md.ToMediaFile() → 转换为模型                    │
+│     ├─ 收集 uniqueTags                                                  │
+│     └─ 记录 albumIDMap（旧专辑ID → 新专辑ID）用于 annotation 迁移       │
+│                                                                          │
+│  4. createAlbumsFromMediaFiles()                                         │
+│     └─ 按 AlbumID 分组 → songs.ToAlbum() → entry.albums                 │
+│                                                                          │
+│  5. createArtistsFromMediaFiles()                                        │
+│     └─ 合并所有 Participants → entry.artists                            │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 阶段 B：数据库写入（事务内，`phase_1_folders.go:329-432`）
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  persistChanges(entry)                                                   │
+│                                                                          │
+│  ┌─ WithTx(...) 开启事务 ──────────────────────────────────────────────┐ │
+│  │                                                                      │ │
+│  │  1. folderRepo.Put(folder)                                           │ │
+│  │     → 更新 folder.hash, num_audio_files, image_files 等              │ │
+│  │                                                                      │ │
+│  │  2. tagRepo.Add(libID, entry.tags...)                                │ │
+│  │     ├─ INSERT INTO tag (ON CONFLICT DO NOTHING)                     │ │
+│  │     └─ INSERT INTO library_tag (ON CONFLICT DO NOTHING)             │ │
+│  │                                                                      │ │
+│  │  3. 遍历 entry.artists:                                              │ │
+│  │     ├─ artistRepo.Put(artist, colsToUpdate...)                      │ │
+│  │     │  (只更新 name, mbz_artist_id, sort_artist_name 等列)           │ │
+│  │     ├─ libraryRepo.AddArtist(libID, artistID)                       │ │
+│  │     │  (INSERT INTO library_artist, ON CONFLICT DO NOTHING)         │ │
+│  │     └─ 收集 artworkIDs（非 Unknown/Various）                         │ │
+│  │                                                                      │ │
+│  │  4. 遍历 entry.albums:                                               │ │
+│  │     ├─ persistAlbum(album, albumIDMap)                              │ │
+│  │     │  ├─ albumRepo.Put(album)                                      │ │
+│  │     │  ├─ albumRepo.ReassignAnnotation(prevID, newID)               │ │
+│  │     │  └─ albumRepo.CopyAttributes(prevID, newID, "created_at")     │ │
+│  │     └─ 收集 artworkIDs                                              │ │
+│  │                                                                      │ │
+│  │  5. 遍历 entry.tracks:                                               │ │
+│  │     └─ mfRepo.Put(track)                                            │ │
+│  │        (putByMatch: path + library_id)                              │ │
+│  │        → updateParticipants(media_file_artists)                     │ │
+│  │                                                                      │ │
+│  │  6. if len(missingTracks) > 0:                                      │ │
+│  │     ├─ mfRepo.MarkMissing(true, missingTracks...)                   │ │
+│  │     └─ albumRepo.Touch(albumIDs) （标记需要刷新的专辑）              │ │
+│  │                                                                      │ │
+│  └─ 事务提交 ───────────────────────────────────────────────────────────┘ │
+│                                                                          │
+│  事务成功后：PreCache(artworkIDs) → 异步封面预热                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 事务边界与失败影响范围
+
+#### 事务分层设计
+
+| 层级 | 事务范围 | 失败影响 | 代码位置 |
+|-----|---------|---------|---------|
+| 1. 扫描准备 | `prepareLibrariesForScan()` 每个库独立事务 | 该库跳过扫描，其他库继续 | `scanner.go:131` |
+| 2. Phase 1 文件夹 | 每个文件夹独立事务 | 仅该文件夹回滚，其他文件夹不受影响 | `phase_1_folders.go:336` |
+| 3. GC 清理 | 所有库在同一事务 | 全部回滚 | `scanner.go:233` |
+| 4. 库状态更新 | 每个库独立事务 | 该库 `last_scan_at` 未更新 | `scanner.go:295` |
+
+#### 单文件夹事务内的失败原子性
+
+在 `persistChanges()` 的事务中，**任一步骤失败都会导致整个文件夹回滚**：
+- 文件夹写入失败 → 整个文件夹回滚
+- 标签写入失败 → 整个文件夹回滚（包括已写入的 folder）
+- 艺术家写入失败 → 整个文件夹回滚（包括已写入的 folder、tags）
+- 依此类推...
+
+**例外情况**：
+- `loadTagsFromFiles()` 在事务外执行，文件读取失败只会跳过该文件夹，不影响其他
+- 封面预热在事务提交后执行，失败不影响数据库状态
+
+### 8.3 增量扫描触发更新的条件层级
+
+增量扫描采用 **三级过滤机制**，逐层缩小需要处理的范围：
+
+```
+Level 1: 文件夹级过滤 (isOutdated)
+    ↓ 只有 outdated 的文件夹才进入下一阶段
+Level 2: 文件级过滤 (modTime 比较)
+    ↓ 只有修改时间更新的文件才读取标签
+Level 3: 字段级更新 (Upsert)
+    只有实际变化的字段才被写入
+```
+
+#### Level 1: 文件夹级判断 (`folder_entry.go:65-70`)
+
+```go
+func (f *folderEntry) isOutdated() bool {
+    // 全量扫描 + 文件夹在扫描开始后未更新 → 强制处理
+    if f.job.lib.FullScanInProgress && f.updTime.Before(f.job.lib.LastScanStartedAt) {
+        return true
+    }
+    // 增量扫描：比较文件夹哈希
+    return f.prevHash != f.hash()
+}
+```
+
+**哈希因子**（`folder_entry.go:84-118`）：
+- 目录修改时间 (modTime)
+- 播放列表数量、子目录数量、图片更新时间
+- 所有音频文件的名称、大小、修改时间（排序后）
+- 所有图片文件的名称、大小、修改时间（排序后）
+
+#### Level 2: 文件级判断 (`phase_1_folders.go:230-248`)
+
+```go
+for afPath, af := range entry.audioFiles {
+    dbTrack, foundInDB := dbTracks[fullPath]
+    if !foundInDB || p.state.fullScan {
+        filesToImport[fullPath] = dbTrack  // 新文件或全量扫描 → 导入
+    } else {
+        info, _ := af.Info()
+        // 增量扫描：文件修改时间晚于 DB 记录，或已标记为 missing → 导入
+        if info.ModTime().After(dbTrack.UpdatedAt) || dbTrack.Missing {
+            filesToImport[fullPath] = dbTrack
+        }
+    }
+    delete(dbTracks, fullPath)  // 从 DB 列表移除，剩余的即为 missing
+}
+```
+
+#### Level 3: 字段级更新（Upsert 逻辑）
+
+所有实体通过 `sql_base_repository.go:397-452` 的 `put()` 实现 **"先查后更/插"**：
+
+```go
+func (r sqlRepository) put(id string, m any, colsToUpdate ...string) (string, error) {
+    if id != "" {
+        // 有 ID → 先 UPDATE
+        update := Update(r.tableName).Where(Eq{"id": id}).SetMap(updateValues)
+        count, err := r.executeSQL(update)
+        if count > 0 {
+            return id, nil  // 更新成功
+        }
+    }
+    // 无 ID 或 UPDATE 影响 0 行 → INSERT
+    if id == "" {
+        id = id2.NewRandom()
+    }
+    insert := Insert(r.tableName).SetMap(values)
+    _, err = r.executeSQL(insert)
+    return id, err
+}
+```
+
+**增量更新的关键保护**：
+- **created_at 保护**：`put()` 中删除 `created_at` 字段，避免覆盖
+- **birth_time 保护**：媒体文件的 `birth_time` 也被排除
+- **部分列更新**：`colsToUpdate` 参数只更新指定字段（艺术家只更新 6 个字段）
+
+### 8.4 关联表写入机制
+
+#### Participants（艺术家关联）
+
+`sql_participations.go:53-100` 的 `updateParticipants()` 采用 **"先删后插"** 策略：
+
+```go
+func (r sqlRepository) updateParticipants(itemID string, participants model.Participants) error {
+    // 1. DELETE 所有旧关联（确保角色变更时清理）
+    sqd := Delete(r.tableName + "_artists").Where(Eq{r.tableName + "_id": itemID})
+    // 2. INSERT 新关联（通过 JOIN artist 过滤不存在的艺术家 ID）
+    query := `INSERT INTO media_file_artists (media_file_id, artist_id, role, sub_role)
+              SELECT ?, json_extract(value, '$.artist_id'),
+                     json_extract(value, '$.role'),
+                     COALESCE(json_extract(value, '$.sub_role'), '')
+              FROM json_each(?)
+              JOIN artist ON artist.id = json_extract(value, '$.artist_id')
+              ON CONFLICT (artist_id, media_file_id, role, sub_role) DO NOTHING`
+}
+```
+
+#### Tags（标签关联）
+
+`tag_repository.go:25-49` 的 `Add()` 采用幂等写入：
+- 批量插入 `tag` 表（`ON CONFLICT DO NOTHING`）
+- 批量插入 `library_tag` 关联表
+- 实际引用存储在 `media_file.tags` JSON 字段中
+
+### 8.5 全量 / 增量 / 选择性扫描对比
+
+| 维度 | 增量扫描 (Incremental) | 全量扫描 (Full) | 选择性扫描 (Selective) |
+|-----|------------------------|-----------------|------------------------|
+| **触发条件** | 定时、启动、文件监视器 | 手动、迁移后、PID变更 | 文件监视器局部变更 |
+| **扫描范围** | 所有库的所有文件夹 | 所有库的所有文件夹 | 仅指定 `targets` 文件夹 |
+| **Level 1 判断** | 比较 folder.hash | 强制所有文件夹处理 (FullScanInProgress=true) | 比较 folder.hash（仅目标） |
+| **Level 2 判断** | modTime > dbTrack.UpdatedAt | 所有文件强制导入 | modTime > dbTrack.UpdatedAt（仅目标） |
+| **lastUpdates 加载** | 所有文件夹 | 所有文件夹 | 仅目标文件夹 + 子目录 (`GetFolderUpdateInfoBatch`) |
+| **changesDetected** | 有文件夹处理才设为 true | 初始即为 true | 有文件夹处理才设为 true |
+| **GC 范围** | 所有库 | 所有库 | 仅目标库 (`libraryIDs` 参数) |
+| **PurgeMissing** | 配置为 always 时执行 | 配置为 always/full 时执行 | 配置为 always 时执行 |
+| **统计刷新** | 有变化才刷新 | 必定刷新 | 有变化才刷新 |
+| **DB optimize** | 不执行 | 执行 (`PRAGMA optimize`) | 不执行 |
+
+**关键差异代码**：
+- 选择性扫描：`scanner.go:79-94` 构建 `targets map`，`folder_repository.go:138-170` 批量查询目标文件夹
+- 全量扫描：`scanner.go:67-69` 初始化 `changesDetected=true`，`phase_1_folders.go:234` 强制导入所有文件
+
+### 8.6 GC 清理流程
+
+扫描完成后在 `persistence.go:170-202` 的 `GC()` 中执行，**顺序执行**以下清理：
+
+```
+1. album.purgeEmpty(libraryIDs)
+   → DELETE FROM album WHERE id NOT IN (SELECT album_id FROM media_file)
+   
+2. artist.purgeEmpty()
+   → DELETE FROM artist WHERE id NOT IN (SELECT artist_id FROM album_artists)
+   → 同时清理上传的封面图片文件
+   
+3. artist.markMissing()
+   → UPDATE artist SET missing = true WHERE 所有专辑都 missing
+   
+4. folder.purgeEmpty(libraryIDs)
+   → DELETE FROM folder WHERE num_audio_files=0 AND 无引用
+   
+5. clean annotations (album/artist/mediafile)
+   → 删除无对应实体的 annotation 记录
+   
+6. tag.purgeUnused()
+   → DELETE FROM tag WHERE id 不被任何 album/media_file 引用
+   
+7. playlist.removeOrphans()
+   → 删除无对应 media_file 的 playlist_tracks 记录
+```
+
