@@ -680,60 +680,118 @@ func (m *Manager) unloadPlugin(name string) error {
 }
 ```
 
-#### 4.3.3 TaskQueue 任务恢复
+#### 4.3.3 TaskQueue 任务状态迁移与持久化恢复
+
+TaskQueue 是唯一拥有 SQLite 持久化的模块，支持崩溃/重启后的任务状态恢复。其状态迁移机制如下：
+
+**任务状态定义**：
+- `pending` - 待执行，等待 worker 取出
+- `running` - 正在执行中
+- `completed` - 执行成功
+- `failed` - 重试耗尽后标记为失败
+- `cancelled` - 已取消
+
+**创建队列时的崩溃恢复** (`host_taskqueue.go:234-241`）
 
 ```go
-// host_taskqueue.go:234-241
-// 重启时重置挂起的任务
+// CreateQueue 时重置上次崩溃遗留的 running 状态任务为 pending
 _, err = s.db.ExecContext(ctx, `
     UPDATE tasks SET status = ?, updated_at = ? WHERE queue_name = ? AND status = ?
 `, taskStatusPending, now, name, taskStatusRunning)
 ```
 
-**关闭时恢复** (`host_taskqueue.go:581-588`）
+> 这是针对上次进程异常退出（未优雅关闭）的场景：上次运行中处于 `running` 状态的任务，在重启创建队列时被重置为 `pending`，重新进入待执行队列。
+
+**优雅关闭时的状态重置** (`host_taskqueue.go:581-588`）
 
 ```go
-// Close 时将运行中的任务标记为 pending，下次启动时恢复
+// Close 时主动将当前 running 任务重置为 pending，供下次启动重新调度
 if _, err := s.db.Exec(`UPDATE tasks SET status = ?, updated_at = ? WHERE status = ?`, taskStatusPending, now, taskStatusRunning); err != nil {
     log.Error("Failed to reset running tasks on shutdown", "plugin", s.pluginName, err)
 }
 ```
 
-#### 4.3.4 WebSocket 连接恢复
+**执行中断时的状态回滚** (`host_taskqueue.go:490-498`）
+
+```go
+// shutdown 或 context 取消时，回滚 running 任务为 pending，并将 attempt 计数减 1（不消耗重试次数）
+func (s *taskQueueServiceImpl) revertTaskToPending(taskID string) {
+    _, err := s.db.Exec(`UPDATE tasks SET status = ?, attempt = MAX(attempt - 1, 0), updated_at = ? WHERE id = ? AND status = ?`,
+        taskStatusPending, now, taskID, taskStatusRunning)
+}
+```
+
+**完整状态迁移图**：
+```
+        Enqueue          Dequeue          Success
+pending ────────→ running ────────→ completed
+          ↑          │
+          │          │ Failure (within retries)
+          │          └───────────→ pending (with backoff)
+          │
+          │ Failure (retries exhausted)
+          └───────────→ failed
+
+Shutdown/Crash: running → pending (重置重试计数)
+Cancel:     pending → cancelled
+```
+
+#### 4.3.4 WebSocket 连接卸载清理（无持久化恢复）
+
+WebSocket 模块**没有持久化**，所有连接状态仅保存在内存中。Close 时仅执行连接关闭与资源释放，重启后不会自动恢复连接。
 
 ```go
 // host_websocket.go:198-229
-// 插件卸载时关闭所有连接
+// 插件卸载时关闭所有活跃连接，发送关闭通知后释放资源
 func (s *webSocketServiceImpl) Close() error {
     for connID, wsConn := range connections {
         wsConn.closeMu.Lock()
         wsConn.isClosed = true
         wsConn.closeMu.Unlock()
+        // 发送关闭帧通知对端
         closeMsg := websocket.FormatCloseMessage(websocket.CloseGoingAway, "plugin unloaded")
-        wsConn.conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(2*time.Second))
-        wsConn.conn.Close()
+        _ = wsConn.conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(2*time.Second))
+        _ = wsConn.conn.Close()
         close(wsConn.done)
+        // 调用插件的 on_close 回调
         s.invokeOnClose(ctx, connID, websocket.CloseGoingAway, "plugin unloaded")
     }
     return nil
 }
 ```
 
-#### 4.3.5 Scheduler 任务清理
+> **特性**：WebSocket 连接是瞬时的，卸载即断开，重启后需要插件主动重新建立连接。没有任何持久化或自动重连机制。
+
+#### 4.3.5 Scheduler 定时任务卸载清理（无持久化恢复）
+
+Scheduler 模块**没有持久化**，所有定时任务仅保存在内存中。Close 时仅停止 timer 或从全局 scheduler 移除，重启后不会自动恢复调度。
 
 ```go
 // host_scheduler.go:147-164
+// 插件卸载时取消所有定时任务，不做任何持久化
 func (s *schedulerServiceImpl) Close() error {
     for scheduleID, entry := range schedules {
         if entry.timer != nil {
-            entry.timer.Stop()
+            entry.timer.Stop()  // 一次性任务：停止 timer
         } else {
-            s.scheduler.Remove(entry.entryID)
+            s.scheduler.Remove(entry.entryID)  // 循环任务：从全局调度器移除
         }
     }
     return nil
 }
 ```
+
+> **特性**：定时任务是内存态的，卸载即取消，重启后需要插件在 `nd_on_init` 中重新注册调度。没有任何持久化或自动恢复机制。
+
+#### 各模块恢复能力对比表
+
+| 模块 | 持久化存储 | 卸载清理 | 重启恢复 | 说明 |
+|-----|-----------|---------|---------|------|
+| **TaskQueue** | ✅ SQLite | 重置 running → pending | ✅ 自动恢复 | Close 时重置状态，重启 CreateQueue 时重新调度 |
+| **KVStore** | ✅ SQLite | 关闭 DB 连接 | ✅ 数据保留 | 数据持久化，重启后重新打开即可访问 |
+| **WebSocket** | ❌ 无 | 关闭所有连接 | ❌ 需手动重连 | 连接是瞬时的，无状态 |
+| **Scheduler** | ❌ 无 | 停止 timer/移除调度 | ❌ 需重新注册 | 调度是内存态的，无状态 |
+| **Cache** | ❌ 内存 | 清空缓存 | ❌ 数据丢失 | 纯内存缓存，无持久化 |
 
 #### 4.3.6 KVStore 清理
 
@@ -827,14 +885,14 @@ func (m *Manager) EnablePlugin(ctx context.Context, id string) error {
 func (m *Manager) checkPermissionGates(p *model.Plugin) error {
     manifest, err := readManifest(p.Path)
     
-    // Gate 1: Users 权限需要配置用户或 allUsers=true
+    // 仅检查 Users 权限配置：声明了 users 权限时，必须配置了具体用户或 allUsers=true
     if manifest.Permissions != nil && manifest.Permissions.Users != nil {
         if !hasValidUsersConfig(p.Users, p.AllUsers) {
             return fmt.Errorf("users permission requires configuration: select users or enable 'all users' access")
         }
     }
     
-    // Gate 2: Library 权限需要配置库或 allLibraries=true
+    // 仅检查 Library 权限配置：声明了 library 权限时，必须配置了具体库或 allLibraries=true
     if manifest.Permissions != nil && manifest.Permissions.Library != nil {
         if !hasValidLibrariesConfig(p.Libraries, p.AllLibraries) {
             return fmt.Errorf("library permission requires configuration: select libraries or enable 'all libraries' access")
@@ -844,6 +902,10 @@ func (m *Manager) checkPermissionGates(p *model.Plugin) error {
     return nil
 }
 ```
+
+> **覆盖边界澄清**：`checkPermissionGates` **只检查 Users 和 Library 两项权限的配置有效性**，不检查其他任何权限（HTTP、KVStore、Scheduler、WebSocket、TaskQueue、Cache、Artwork、SubsonicAPI 等均不检查）。
+>
+> 它检查的是"配置是否完整"——即当插件声明了 users/library 权限时，管理员必须在启用前完成具体的用户/库授权配置，不能留空。
 
 **配置有效性检查** (`manager.go:616-644`）
 
@@ -1192,7 +1254,7 @@ tinygo build -o minimal.wasm -target wasip1 -buildmode=c-shared .
 
 4. **实例级隔离**：每次调用创建新 WASM 实例，故障影响范围最小化
 
-5. **完整的资源清理**：通过 `closers` 模式统一管理 KVStore、Scheduler、WebSocket 等资源
+5. **分级的资源与状态管理**：通过 `closers` 模式统一管理资源；TaskQueue 支持持久化任务恢复，而 Scheduler、WebSocket 仅做内存态清理，模块职责边界清晰
 
 6. **配置变更自动处理**：用户/库删除或权限变更时自动禁用插件，防止越权访问
 
