@@ -206,36 +206,41 @@ FTS5 采用**外部内容表**模式 (`content=''`)，通过 AFTER INSERT/UPDATE
 
 **入口**：智能播放列表的 `Rules` 字段，JSON 格式的 criteria 表达式树。
 
-**职责分层架构**：智能播放列表筛选严格遵循四层职责分离，每层只做一件事：
+**职责分层架构**：智能播放列表筛选严格遵循"**1 层条件生成 + 3 条独立递归链路**"的架构。每条链路各自遍历一次表达式树，职责完全分离，互不调用。
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Layer 1: 条件生成（Criteria Expression Construction）        │
-│  Package: model/criteria/                                    │
-│  Files: operators.go, json.go, fields.go, sort.go            │
-└───────────────────────────────┬──────────────────────────────┘
-                                │
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Layer 2: 表达式遍历（Expression Traversal）                 │
-│  Package: model/criteria/walk.go                             │
-│  Function: Walk(expr, Visitor) — 纯遍历，不做 SQL 构建       │
-└───────────────────────────────┬──────────────────────────────┘
-                                │
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Layer 3: JOIN 判定（Join Determination）                    │
-│  File: persistence/criteria_sql.go                           │
-│  Functions: ExpressionJoins(), RequiredJoins(), fieldJoinType()│
-└───────────────────────────────┬──────────────────────────────┘
-                                │
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Layer 4: SQL 条件构建（SQL Condition Construction）         │
-│  File: persistence/criteria_sql.go                           │
-│  Function: exprSQL() — 表达式 → squirrel.Sqlizer             │
-└──────────────────────────────────────────────────────────────┘
+                    Layer 1: 条件生成（Criteria Expression Construction）
+                    Package: model/criteria/
+                    Files: operators.go, json.go, fields.go, sort.go
+                    JSON → criteria.Criteria 表达式树
+                                    │
+                                    ▼
+        ┌───────────────────────────┼───────────────────────────┐
+        │                           │                           │
+ ▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌  ▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌  ▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌
+ ▌ 链路 A: 子播放列表依赖提取   ▌ 链路 B: JOIN 判定          ▌ 链路 C: SQL 条件拼装       ▌
+ ▌ (子播放列表刷新前置)         ▌ (构建 SELECT 骨架)        ▌ (注入 WHERE 条件)         ▌
+ ▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌  ▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌  ▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌
+        │                           │                           │
+        ▼                           ▼                           ▼
+ extractPlaylistIds() 递归        Walk() + Fields()           exprSQL() 递归
+ operators.go#L181-L205           walk.go#L7-L33               criteria_sql.go#L129-L198
+        │                           │                           │
+        │  【递归方式】              │  【递归方式】              │  【递归方式】
+        │  type switch:             │  Walk() 内置递归:          │  type switch:
+        │  Any/All → 遍历 children  │  Any/All → Walk(child)    │  Any/All → Or{}/And{}
+        │  InPlaylist → 提取 id     │  叶子节点 → 返回 nil       │  叶子 → Eq/Like/In 等
+        │  NotInPlaylist → 提取 id  │                           │
+        │                           │  Visitor 做什么?           │  【SQL 构建逻辑】
+        │                           │  收集 Fields(expr)         │  每个操作符对应不同的
+        │                           │  → 字段 → JOIN 映射        │  squirrel.Sqlizer 构建
+        │                           │                           │
+        ▼                           ▼                           ▼
+ 依赖的子播放列表 ID 列表        需要的 JOIN 类型位图         WHERE 条件 Sqlizer
+ (用于 refreshChildPlaylists)   (用于 LEFT JOIN 注入)         (用于 sq.Where())
 ```
+
+> **统一声明**：以上三条链路是**完全独立的三个递归遍历过程**，各自遍历一次表达式树。链路 B 中的 `Walk()` **只负责收集和判断依赖**（字段 → JOIN 映射），**不参与任何 SQL 条件构建**。SQL 条件拼装由链路 C 的 `exprSQL()` 通过另一条独立递归链路完成。
 
 **详细调用链**：
 
@@ -243,7 +248,7 @@ FTS5 采用**外部内容表**模式 (`content=''`)，通过 AFTER INSERT/UPDATE
 [persistence/smart_playlist_repository.go#L19-L72]
 refreshSmartPlaylist(pls)
     │
-    ├─► Layer 1: 条件生成
+    ├─► Layer 1: 条件生成（只做一次）
     │   ├─► JSON 反序列化 [model/criteria/json.go]
     │   │   └─► 构建 criteria.Criteria 表达式树
     │   ├─► fields.go: 字段元数据注册（FieldInfo: IsTag/IsRole/Numeric）
@@ -258,26 +263,39 @@ refreshSmartPlaylist(pls)
     │       }
     │
     ├─► refreshChildPlaylists(pls, rulesSQL)
-    │   └─► ChildPlaylistIds() 遍历表达式树提取依赖的播放列表
+    │   │
+    │   └─► 【链路 A】子播放列表依赖提取（只遍历一次）
+    │       └─► ChildPlaylistIds() [criteria.go#L62-L75]
+    │           └─► conjunction.ChildPlaylistIds()
+    │               └─► extractPlaylistIds() 递归 [operators.go#L181-L205]
+    │                   ├─► Any/All: 遍历 children 递归
+    │                   ├─► InPlaylist: 提取 rule["id"]
+    │                   └─► NotInPlaylist: 提取 rule["id"]
     │
     ├─► resolvePercentageLimit(pls, &rulesSQL, usr.ID)
     │   │
-    │   ├─► Layer 3: JOIN 判定 [criteria_sql.go#L444-L453]
-    │   │   └─► ExpressionJoins()
-    │   │       └─► Layer 2: Walk() 遍历表达式树
-    │   │           └─► fieldJoinType(field) → smartPlaylistJoinType
-    │   │               ├─► albumrating → smartPlaylistJoinAlbumAnnotation
-    │   │               └─► artistloved → smartPlaylistJoinArtistAnnotation
+    │   ├─► 【链路 B】JOIN 判定（第一次遍历，COUNT 查询用）
+    │   │   └─► ExpressionJoins() [criteria_sql.go#L444-L453]
+    │   │       └─► Walk(expr, Visitor) 遍历表达式树 [walk.go]
+    │   │           └─► Visitor: Fields(expr) 收集字段
+    │   │               └─► fieldJoinType(field) → JOIN 位图
+    │   │                   ├─► albumrating → smartPlaylistJoinAlbumAnnotation
+    │   │                   └─► artistloved → smartPlaylistJoinArtistAnnotation
     │   │
-    │   ├─► 构建 COUNT 查询，按需 LEFT JOIN annotation 表
+    │   ├─► 构建 COUNT 查询：根据 JOIN 位图加入 LEFT JOIN
     │   │
-    │   └─► Layer 4: SQL 条件构建
-    │       └─► Where() → exprSQL() 递归生成 squirrel.Sqlizer
+    │   └─► 【链路 C】SQL 条件拼装（第一次遍历生成 WHERE）
+    │       └─► Where() → exprSQL() 递归 [criteria_sql.go#L129-L198]
+    │           ├─► All → And{exprSQL(child) ...}
+    │           ├─► Is → Eq{}
+    │           ├─► Contains → Like{}
+    │           └─► InPlaylist → IN (subquery)
     │
     ├─► buildSmartPlaylistQuery(pls, rulesSQL, usr.ID)
     │   │
-    │   ├─► Layer 3: JOIN 判定 [criteria_sql.go#L455-L461]
-    │   │   └─► RequiredJoins() = ExpressionJoins() + SortFieldNames()
+    │   ├─► 【链路 B】JOIN 判定（第二次遍历，主查询用）
+    │   │   └─► RequiredJoins() [criteria_sql.go#L455-L461]
+    │   │       └─► ExpressionJoins() + SortFieldNames()
     │   │
     │   ├─► addSmartPlaylistAnnotationJoins(sq, requiredJoins, userID)
     │   │   ├─► album_annotation LEFT JOIN（如果需要）
@@ -285,15 +303,22 @@ refreshSmartPlaylist(pls)
     │   │
     │   ├─► applyLibraryFilter(sq, "media_file")      // 库权限过滤
     │   │
-    │   └─► Layer 4: OrderBy() → sortExpr() 生成排序 SQL
+    │   └─► 【链路 C】排序 SQL 生成
+    │       └─► OrderBy() → sortExpr() [criteria_sql.go 末尾]
     │
     ├─► addCriteria(sq, rulesSQL) [smart_playlist_repository.go#L190-L202]
     │   │
-    │   └─► Layer 4: Where() → exprSQL() [criteria_sql.go#L129-L198]
-    │       └─► 递归将表达式树转换为 squirrel.Sqlizer
+    │   └─► 【链路 C】SQL 条件拼装（第二次遍历生成 WHERE）
+    │       └─► Where() → exprSQL() [criteria_sql.go#L129-L198]
+    │           └─► type switch 递归生成 squirrel.Sqlizer
     │
     └─► INSERT INTO playlist_tracks SELECT ...
 ```
+
+> **注意**：在一次智能播放列表刷新中，表达式树被**三条独立递归链路合计遍历了 5 次**：
+> - 链路 A (`extractPlaylistIds`)：遍历 1 次（刷新子播放列表前置）
+> - 链路 B (`Walk()`)：遍历 2 次（`resolvePercentageLimit` 的 COUNT 查询 1 次 + `buildSmartPlaylistQuery` 的主查询 1 次）
+> - 链路 C (`exprSQL()`)：遍历 2 次（`resolvePercentageLimit` 的 COUNT 查询 WHERE 1 次 + `addCriteria` 的主查询 WHERE 1 次）
 
 **Layer 1: 条件生成**（`model/criteria/` 包，纯领域层，无 SQL 依赖）
 
@@ -304,7 +329,7 @@ refreshSmartPlaylist(pls)
 | [fields.go](file:///d:/fz/0601-1/solo-dogfeeding/code/30-navidrome/model/criteria/fields.go) | 字段元数据注册表，标记字段语义属性 | `FieldInfo{IsTag, IsRole, Numeric, Boolean}`, `LookupField()`, `AddRoles()`, `AddTagNames()` |
 | [sort.go](file:///d:/fz/0601-1/solo-dogfeeding/code/30-navidrome/model/criteria/sort.go) | 排序字段解析，处理 `+`/`-` 前缀和多列排序 | `OrderByFields()`, `SortFieldNames()` |
 
-**Layer 2: 表达式遍历**（`model/criteria/walk.go`，纯遍历逻辑）
+**链路 B: JOIN 判定（Walk 遍历）**（[walk.go#L7-L33](file:///d:/fz/0601-1/solo-dogfeeding/code/30-navidrome/model/criteria/walk.go#L7-L33)，Visitor 模式遍历  只收集字段映射为 JOIN 类型，**不构建 SQL**）
 
 ```go
 func Walk(expr Expression, visit Visitor) error {
@@ -322,11 +347,11 @@ func Walk(expr Expression, visit Visitor) error {
 }
 ```
 
-> **关键特性**：`Walk()` 是纯遍历函数，**不构建任何 SQL**。它只负责访问表达式树的每个节点，具体对每个节点做什么由传入的 `Visitor` 函数决定。`Walk()` 被两个不同的 Visitor 用于两个完全不同的目的：
-> 1. **JOIN 判定**：收集字段名 → 判定 JOIN 类型
-> 2. **SQL 构建**：递归 `exprSQL()` 中隐式使用类型 switch 遍历（不调用 `Walk()`）
+> 链路 B 中 `Walk()` **只做一件事：收集字段并映射为 JOIN 类型**，**不参与任何 SQL 条件构建**。`criteria.Fields(expr)` 只返回叶子节点字段 map，不递归，递归由 Walk() 内置逻辑完成。
+>
+> 子播放列表 ID 提取由**链路 A（`extractPlaylistIds` 独立递归）**完成，**不调用 `Walk()`**。SQL 条件构建由**链路 C（`exprSQL` 独立递归）**完成，也**不调用 `Walk()`**。三条链路是完全独立的递归遍历。
 
-**Layer 3: JOIN 判定**（`persistence/criteria_sql.go`，纯判定，不构建 SQL 条件）
+**链路 B 判定逻辑**（`persistence/criteria_sql.go`，只产出 JOIN 位图）
 
 ```go
 // 判定 WHERE 条件中引用的字段需要哪些 JOIN
@@ -358,7 +383,7 @@ func fieldJoinType(name string) smartPlaylistJoinType {
 }
 ```
 
-**Layer 4: SQL 条件构建**（`persistence/criteria_sql.go#L129-L198`，表达式 → SQL）
+**链路 C: SQL 条件拼装**（`persistence/criteria_sql.go#L129-L198`，表达式 → SQL，**独立 type switch 递归，不调用 Walk()**）
 
 | Criteria 操作符 | SQL 实现 |
 |----------------|---------|
@@ -379,7 +404,7 @@ func fieldJoinType(name string) smartPlaylistJoinType {
 - **不使用 FTS5**，模糊匹配用原生 `LIKE` 实现
 - 不经过 Repository 层的 `Search()` 或 `GetAll()` 方法
 - 直接构建 `INSERT INTO ... SELECT ...` 查询
-- **四层职责严格分离**：条件生成 → 表达式遍历 → JOIN 判定 → SQL 构建
+- **三条链路严格分离**：链路A(extractPlaylistIds独立递归提取依赖)→链路B(Walk仅判定JOIN不构建SQL)→链路C(exprSQL独立递归构建WHERE)
 - `Walk()` 仅用于 JOIN 判定，SQL 构建通过独立的 `exprSQL()` 递归实现
 - **不受**单字符查询限制
 
@@ -501,7 +526,7 @@ AND
 | **过滤叠加点** | Phase 1 `rowidQuery` 的 WHERE | 主查询 WHERE | `buildSmartPlaylistQuery` 的 WHERE |
 | **过滤时机** | 排序前过滤（最优） | 排序后或同时过滤（取决于查询计划） | 与排序同时（子查询一次性构建） |
 | **库权限过滤** | Phase 1 叠加（applyLibraryFilter） | newSelect 内 applyLibraryFilter | buildSmartPlaylistQuery 内 applyLibraryFilter |
-| **其他筛选器叠加** | Phase 1 WHERE 叠加 options.Filters | parseRestFilters 构建 And{}，GetAll 时注入主 WHERE | criteria.Walk 遍历表达式树，按需 JOIN |
+| **其他筛选器叠加** | Phase 1 WHERE 叠加 options.Filters | parseRestFilters 构建 And{}，GetAll 时注入主 WHERE | 链路 B Walk() 判定 JOIN → 链路 C exprSQL() 独立递归构建 WHERE |
 | **执行阶段数** | 2 阶段（rowid 排序 + 字段水化） | 1 阶段（单条 SQL） | 1 阶段（INSERT SELECT） |
 
 ### 5.2 搜索接口（Search API）过滤叠加详解
@@ -574,28 +599,95 @@ Phase 2: 全字段水化
 
 ### 5.4 智能播放列表（Smart Playlist）过滤叠加详解
 
+**执行流程**：
+
 ```
+Step 1: 链路 B — JOIN 判定（先判定需要哪些 JOIN，再构建查询骨架）
+┌──────────────────────────────────────────────────────────┐
+│ 调用 rulesSQL.ExpressionJoins() / RequiredJoins()         │
+│   └─► criteria.Walk() 遍历表达式树                        │
+│       └─► Visitor 收集所有字段名                          │
+│           └─► fieldJoinType() 判定 JOIN 类型              │
+│               ├─► albumrating → 需要 album_annotation     │
+│               └─► artistloved → 需要 artist_annotation    │
+└──────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+Step 2: 构建 SELECT 骨架（根据 JOIN 判定结果加 JOIN）
+┌──────────────────────────────────────────────────────────┐
+│ SELECT                                                    │
+│   row_number() over (order by ...) as id,                 │
+│   'playlist-xxx' as playlist_id,                          │
+│   media_file.id as media_file_id                          │
+│ FROM media_file                                           │
+│ LEFT JOIN annotation ON (...user_id = ?)                  │  ◄── 总是加
+│ LEFT JOIN annotation AS album_annotation ON (...)          │  ◄── 仅当需要
+│ LEFT JOIN annotation AS artist_annotation ON (...)         │  ◄── 仅当需要
+└──────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+Step 3: 链路 C — SQL 条件拼装（exprSQL() 递归，独立遍历表达式树）
+┌──────────────────────────────────────────────────────────┐
+│ WHERE                                                     │
+│   media_file.library_id IN (SELECT ...)                   │  ◄── 库权限过滤
+│   AND (                                                   │  ◄───┐
+│       COALESCE(annotation.play_count, 0) > 0              │      │
+│       AND media_file.year >= 2000                          ├─ 链路 C: exprSQL() 递归
+│       AND media_file.title LIKE '%love%'                   │      │
+│       AND media_file.id NOT IN (SELECT ...)                │  ◄───┘
+│   )                                                       │
+└──────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+Step 4: 排序 + 分页
+┌──────────────────────────────────────────────────────────┐
+│ ORDER BY play_count desc, title asc                       │
+│ LIMIT 100                                                 │
+└──────────────────────────────────────────────────────────┘
+```
+
+**完整 SQL 示例**：
+
+```sql
 INSERT INTO playlist_tracks (id, playlist_id, media_file_id)
 SELECT
-    row_number() over (order by play_count desc, title asc) as id,
-    'playlist-xxx' as playlist_id,
+    row_number() over (order by COALESCE(annotation.play_count, 0) desc, media_file.title asc) as id,
+    'pl-abc123' as playlist_id,
     media_file.id as media_file_id
 FROM media_file
-LEFT JOIN annotation ON (annotation.item_id = media_file.id AND annotation.item_type = 'media_file' AND annotation.user_id = ?)
-LEFT JOIN annotation AS album_annotation ON (album_annotation.item_id = media_file.album_id AND ...)
+LEFT JOIN annotation ON (
+    annotation.item_id = media_file.id
+    AND annotation.item_type = 'media_file'
+    AND annotation.user_id = 'user-123'
+)
+LEFT JOIN annotation AS album_annotation ON (
+    album_annotation.item_id = media_file.album_id
+    AND album_annotation.item_type = 'album'
+    AND album_annotation.user_id = 'user-123'
+)
 WHERE
-    media_file.library_id IN (SELECT ul.library_id FROM user_library ul WHERE ul.user_id = ?)
-    AND (                                                     ◄───┐
-        COALESCE(annotation.play_count, 0) > 0                  │
-        AND media_file.year >= 2000                              ├─ criteria.Walk 遍历构建
-        AND media_file.title LIKE '%love%'                       │
-        AND media_file.id NOT IN (SELECT media_file_id FROM ...)  │
-    )                                                         ◄───┘
-ORDER BY play_count desc, title asc
+    media_file.library_id IN (SELECT ul.library_id FROM user_library ul WHERE ul.user_id = 'user-123')
+    AND (
+        COALESCE(annotation.play_count, 0) > 0
+        AND media_file.year >= 2000
+        AND media_file.title LIKE '%love%'
+        AND media_file.id NOT IN (
+            SELECT media_file_id FROM playlist_tracks pl
+            LEFT JOIN playlist ON pl.playlist_id = playlist.id
+            WHERE pl.playlist_id = 'pl-other'
+              AND (playlist.public = 1 OR playlist.owner_id = 'user-123')
+        )
+    )
+ORDER BY COALESCE(annotation.play_count, 0) desc, media_file.title asc
 LIMIT 100
 ```
 
-> **特点**：通过 `criteria.Walk()` 遍历表达式树，按需引入 annotation JOIN。所有条件直接构建在主 WHERE 中，完全不经过 Repository 层的搜索逻辑。
+> **三条独立链路，职责完全分离**：
+> 1. **链路 A（子播放列表依赖提取）**：`extractPlaylistIds()` 独立递归 → 提取 `InPlaylist`/`NotInPlaylist` 的播放列表 ID → 先刷新子播放列表（此步骤在刷新前执行，不出现在上述 SQL 构建流程中）
+> 2. **链路 B（JOIN 判定）**：`Walk()` 遍历 + `Fields()` 收集字段 → 判定需要哪些 annotation JOIN → 构建 SELECT 骨架时注入 LEFT JOIN
+> 3. **链路 C（SQL 条件拼装）**：`exprSQL()` 独立递归（type switch）→ 每个操作符生成对应 SQL → 注入 WHERE 条件
+>
+> 链路 B 的 `Walk()` **只负责收集字段做 JOIN 判定，不参与任何 SQL 条件构建**。SQL 条件拼装是链路 C 的独立职责，两者互不调用。所有条件直接构建在主 WHERE 中，完全不经过 Repository 层的搜索逻辑。
 
 ---
 
@@ -823,7 +915,7 @@ Navidrome 的搜索架构体现了典型的"**场景分层 + 渐进降级 + 路�
 3. **过滤叠加层级差异**：
    - Search API：Phase 1 `rowidQuery` WHERE 先过滤再排序（最优）
    - REST List Filter：主查询 WHERE 层统一叠加（SQLite 优化器决定顺序）
-   - Smart Playlist：Criteria 表达式树 Walk 构建，按需 JOIN
+   - Smart Playlist：三条链路独立递归 — 链路A(extractPlaylistIds提取依赖)→链路B(Walk仅判定JOIN)→链路C(exprSQL独立递归构建WHERE)
 
 4. **单字符限制只作用于 Search API**：通过将检查放在 `doSearch()` 而不是 `getSearchStrategy()`，实现了路径差异化
 
