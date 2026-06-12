@@ -206,45 +206,159 @@ FTS5 采用**外部内容表**模式 (`content=''`)，通过 AFTER INSERT/UPDATE
 
 **入口**：智能播放列表的 `Rules` 字段，JSON 格式的 criteria 表达式树。
 
-**调用链**：
+**职责分层架构**：智能播放列表筛选严格遵循四层职责分离，每层只做一件事：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Layer 1: 条件生成（Criteria Expression Construction）        │
+│  Package: model/criteria/                                    │
+│  Files: operators.go, json.go, fields.go, sort.go            │
+└───────────────────────────────┬──────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Layer 2: 表达式遍历（Expression Traversal）                 │
+│  Package: model/criteria/walk.go                             │
+│  Function: Walk(expr, Visitor) — 纯遍历，不做 SQL 构建       │
+└───────────────────────────────┬──────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Layer 3: JOIN 判定（Join Determination）                    │
+│  File: persistence/criteria_sql.go                           │
+│  Functions: ExpressionJoins(), RequiredJoins(), fieldJoinType()│
+└───────────────────────────────┬──────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Layer 4: SQL 条件构建（SQL Condition Construction）         │
+│  File: persistence/criteria_sql.go                           │
+│  Function: exprSQL() — 表达式 → squirrel.Sqlizer             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**详细调用链**：
 
 ```
 [persistence/smart_playlist_repository.go#L19-L72]
 refreshSmartPlaylist(pls)
     │
+    ├─► Layer 1: 条件生成
+    │   ├─► JSON 反序列化 [model/criteria/json.go]
+    │   │   └─► 构建 criteria.Criteria 表达式树
+    │   ├─► fields.go: 字段元数据注册（FieldInfo: IsTag/IsRole/Numeric）
+    │   └─► sort.go: 排序字段解析（OrderByFields()）
+    │
     ├─► rulesSQL := newSmartPlaylistCriteria(*pls.Rules, withSmartPlaylistOwner(*usr))
     │   │
     │   └─► [persistence/criteria_sql.go#L34-L45]
     │       type smartPlaylistCriteria struct {
-    │           criteria.Criteria
-    │           owner model.User
+    │           criteria.Criteria  // 嵌入表达式树
+    │           owner model.User   // 权限上下文
     │       }
     │
-    ├─► refreshChildPlaylists(pls, rulesSQL)  // 递归刷新依赖的子播放列表
+    ├─► refreshChildPlaylists(pls, rulesSQL)
+    │   └─► ChildPlaylistIds() 遍历表达式树提取依赖的播放列表
+    │
     ├─► resolvePercentageLimit(pls, &rulesSQL, usr.ID)
-    │
-    ├─► sq := buildSmartPlaylistQuery(pls, rulesSQL, usr.ID)
     │   │
-    │   ├─► SELECT row_number() over (...) as id, ?, media_file.id
-    │   │   FROM media_file
-    │   ├─► addMediaFileAnnotationJoin(sq, userID)    // LEFT JOIN annotation
-    │   ├─► addSmartPlaylistAnnotationJoins(sq, ...)  // LEFT JOIN album_annotation / artist_annotation
-    │   └─► applyLibraryFilter(sq, "media_file")      // 库权限过滤
-    │
-    ├─► sq, err := addCriteria(sq, rulesSQL)
+    │   ├─► Layer 3: JOIN 判定 [criteria_sql.go#L444-L453]
+    │   │   └─► ExpressionJoins()
+    │   │       └─► Layer 2: Walk() 遍历表达式树
+    │   │           └─► fieldJoinType(field) → smartPlaylistJoinType
+    │   │               ├─► albumrating → smartPlaylistJoinAlbumAnnotation
+    │   │               └─► artistloved → smartPlaylistJoinArtistAnnotation
     │   │
-    │   └─► [criteria_sql.go#L190-L202]
-    │       func addCriteria(sql, cSQL) {
-    │           cond, _ := cSQL.Where()
-    │           sql = sql.Where(cond)  // ◄── 在此叠加！
-    │           // criteria.Walk 遍历表达式树构建条件
-    │           // 见 [criteria_sql.go#L129-L198] exprSQL()
-    │       }
+    │   ├─► 构建 COUNT 查询，按需 LEFT JOIN annotation 表
+    │   │
+    │   └─► Layer 4: SQL 条件构建
+    │       └─► Where() → exprSQL() 递归生成 squirrel.Sqlizer
+    │
+    ├─► buildSmartPlaylistQuery(pls, rulesSQL, usr.ID)
+    │   │
+    │   ├─► Layer 3: JOIN 判定 [criteria_sql.go#L455-L461]
+    │   │   └─► RequiredJoins() = ExpressionJoins() + SortFieldNames()
+    │   │
+    │   ├─► addSmartPlaylistAnnotationJoins(sq, requiredJoins, userID)
+    │   │   ├─► album_annotation LEFT JOIN（如果需要）
+    │   │   └─► artist_annotation LEFT JOIN（如果需要）
+    │   │
+    │   ├─► applyLibraryFilter(sq, "media_file")      // 库权限过滤
+    │   │
+    │   └─► Layer 4: OrderBy() → sortExpr() 生成排序 SQL
+    │
+    ├─► addCriteria(sq, rulesSQL) [smart_playlist_repository.go#L190-L202]
+    │   │
+    │   └─► Layer 4: Where() → exprSQL() [criteria_sql.go#L129-L198]
+    │       └─► 递归将表达式树转换为 squirrel.Sqlizer
     │
     └─► INSERT INTO playlist_tracks SELECT ...
 ```
 
-**Criteria 表达式遍历** ([criteria_sql.go#L129-L198](file:///d:/fz/0601-1/solo-dogfeeding/code/30-navidrome/persistence/criteria_sql.go#L129-L198))：
+**Layer 1: 条件生成**（`model/criteria/` 包，纯领域层，无 SQL 依赖）
+
+| 模块 | 职责 | 关键函数/类型 |
+|-----|-----|--------------|
+| [operators.go](file:///d:/fz/0601-1/solo-dogfeeding/code/30-navidrome/model/criteria/operators.go) | 表达式类型定义，每个操作符实现 `Expression` 接口和 `fields()` 方法 | `All`, `Any`, `Is`, `Contains`, `InTheRange`, `InPlaylist`, `IsMissing` 等 20+ 类型 |
+| [json.go](file:///d:/fz/0601-1/solo-dogfeeding/code/30-navidrome/model/criteria/json.go) | JSON 反序列化，将 `{"all": [...]}` 转换为表达式树 | `UnmarshalJSON()`, `marshalConjunction()`, `marshalExpression()` |
+| [fields.go](file:///d:/fz/0601-1/solo-dogfeeding/code/30-navidrome/model/criteria/fields.go) | 字段元数据注册表，标记字段语义属性 | `FieldInfo{IsTag, IsRole, Numeric, Boolean}`, `LookupField()`, `AddRoles()`, `AddTagNames()` |
+| [sort.go](file:///d:/fz/0601-1/solo-dogfeeding/code/30-navidrome/model/criteria/sort.go) | 排序字段解析，处理 `+`/`-` 前缀和多列排序 | `OrderByFields()`, `SortFieldNames()` |
+
+**Layer 2: 表达式遍历**（`model/criteria/walk.go`，纯遍历逻辑）
+
+```go
+func Walk(expr Expression, visit Visitor) error {
+    if expr == nil { return nil }
+    if err := visit(expr); err != nil { return err }
+    switch e := expr.(type) {
+    case All:
+        for _, child := range e { Walk(child, visit) }  // 递归遍历子节点
+    case Any:
+        for _, child := range e { Walk(child, visit) }
+    case Is, Contains, InPlaylist, ...:  // 叶子节点，停止递归
+        return nil
+    }
+    return nil
+}
+```
+
+> **关键特性**：`Walk()` 是纯遍历函数，**不构建任何 SQL**。它只负责访问表达式树的每个节点，具体对每个节点做什么由传入的 `Visitor` 函数决定。`Walk()` 被两个不同的 Visitor 用于两个完全不同的目的：
+> 1. **JOIN 判定**：收集字段名 → 判定 JOIN 类型
+> 2. **SQL 构建**：递归 `exprSQL()` 中隐式使用类型 switch 遍历（不调用 `Walk()`）
+
+**Layer 3: JOIN 判定**（`persistence/criteria_sql.go`，纯判定，不构建 SQL 条件）
+
+```go
+// 判定 WHERE 条件中引用的字段需要哪些 JOIN
+func (c smartPlaylistCriteria) ExpressionJoins() smartPlaylistJoinType {
+    var joins smartPlaylistJoinType
+    _ = criteria.Walk(c.Criteria.Expression, func(expr criteria.Expression) error {
+        for field := range criteria.Fields(expr) {  // ◄── Visitor 只做一件事：收集字段
+            joins |= fieldJoinType(field)           // ◄── 字段 → JOIN 类型映射
+        }
+        return nil
+    })
+    return joins
+}
+
+// 判定 WHERE + ORDER BY 总共需要哪些 JOIN
+func (c smartPlaylistCriteria) RequiredJoins() smartPlaylistJoinType {
+    joins := c.ExpressionJoins()
+    for _, name := range c.Criteria.SortFieldNames() {
+        joins |= fieldJoinType(name)
+    }
+    return joins
+}
+
+// 字段 → JOIN 类型映射表 [criteria_sql.go#L432-L442]
+func fieldJoinType(name string) smartPlaylistJoinType {
+    info, _ := criteria.LookupField(name)
+    field, _ := smartPlaylistFields[info.Name()]
+    return field.joinType  // smartPlaylistJoinAlbumAnnotation / smartPlaylistJoinArtistAnnotation
+}
+```
+
+**Layer 4: SQL 条件构建**（`persistence/criteria_sql.go#L129-L198`，表达式 → SQL）
 
 | Criteria 操作符 | SQL 实现 |
 |----------------|---------|
@@ -258,12 +372,15 @@ refreshSmartPlaylist(pls)
 | `InPlaylist` / `NotInPlaylist` | `IN (subquery)` / `NOT IN (subquery)` |
 | `IsMissing` / `IsPresent` | `NOT EXISTS json_tree` / `EXISTS json_tree` |
 
+> **注意**：`exprSQL()` 不调用 `criteria.Walk()`，而是通过自己的 type switch 递归遍历表达式树，因为每个节点需要不同的 SQL 构建逻辑。
+
 **关键特征**：
 - 完全独立的查询构建路径，**不经过 `doSearch()`，也不调用 `getSearchStrategy()`**
 - **不使用 FTS5**，模糊匹配用原生 `LIKE` 实现
 - 不经过 Repository 层的 `Search()` 或 `GetAll()` 方法
 - 直接构建 `INSERT INTO ... SELECT ...` 查询
-- 通过 `criteria.Walk()` 遍历表达式树，按需引入 annotation JOIN
+- **四层职责严格分离**：条件生成 → 表达式遍历 → JOIN 判定 → SQL 构建
+- `Walk()` 仅用于 JOIN 判定，SQL 构建通过独立的 `exprSQL()` 递归实现
 - **不受**单字符查询限制
 
 ---
