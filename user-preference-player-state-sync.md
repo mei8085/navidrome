@@ -402,7 +402,7 @@ Native API 的四个端点：
 2. 再通过 `dataProvider.create('playlistTrack', ...)` 添加所有曲目 ID
 3. 这是用户主动触发的操作，不是自动同步
 
-### 5.5 播放器配置 (Player) 的持久化
+### 5.5 播放器配置 (Player) 的持久化 — 仅 Subsonic 链注册
 
 [player.go](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/model/player.go) 定义了 `Player` 模型，包含：
 
@@ -414,13 +414,34 @@ Native API 的四个端点：
 | `ScrobbleEnabled` | 是否启用 Scrobble |
 | `Client` / `UserAgent` | 客户端标识，用于匹配 |
 
-[players.go](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/core/players.go#L34-L78) 中的 `Register` 逻辑：
+#### players.Register 的调用位置
 
-1. 如果请求携带 `playerID`（来自 cookie `nd-player-<username_hash>`），先按 ID 查找
+`players.Register` 仅在 Subsonic API 中间件中被调用。
+
+**Subsonic 链**：[subsonic/middlewares.go getPlayer](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/middlewares.go#L183-L216) 作为 Subsonic 所有受保护端点的中间件（见 [subsonic/api.go routes()](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/api.go#L99-L233)）。它会：
+
+1. 从 cookie 读取 `playerId`，cookie 命名函数为 `fmt.Sprintf("nd-player-%x", userName)`，即 **`%x` hex 编码用户名**（不是 hash）
+2. 调用 `players.Register(ctx, playerId, client, userAgent, ip)`
+3. 成功后 `request.WithPlayer(ctx, *player)` + `request.WithTranscoding(ctx, *trc)` 注入 context
+4. 写回 `nd-player-<hex(userName)>` cookie（HttpOnly, SameSiteStrict, MaxAge=CookieExpiry）
+
+[players.go Register](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/core/players.go#L34-L78) 逻辑：
+
+1. 如果 cookie 里有 `playerID`，按 ID 查找
 2. 若 ID 对应的 player 的 `Client` 不匹配，则忽略该 ID
 3. 尝试按 `(userId, client, userAgent)` 组合查找已有 player
 4. 若均未找到，创建新 player 记录
-5. 更新 `LastSeen`、`IP`、`UserAgent` 等信息并保存（有频率限制）
+5. 更新 `LastSeen`、`IP`、`UserAgent` 等信息并保存（受 `UpdatePlayerFrequency` 限频）
+6. 若 player 配置了 `TranscodingId`，一并查出关联 `Transcoding`
+
+#### Native API 无 player 注册 → 转码决策在 Subsonic 链完成
+
+**Native API 中间件链（[native_api.go#L63-L66](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/native_api.go#L63-L66)）不存在 `getPlayer` 调用**，因此 Native API 请求的 context 中没有 `request.Player` 和 `request.Transcoding`。这意味着：
+
+- `/api/player` REST 接口允许用户手动增删改查 player 记录（通过管理 UI），但**不会自动为前端 HTTP 访问创建/注册 player**
+- 依赖 `request.PlayerFrom(ctx)` 的逻辑（如 [play_tracker.go](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/core/scrobbler/play_tracker.go#L262) 的 `player.ScrobbleEnabled` 判断、[legacy_client.go](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/core/stream/legacy_client.go#L69-L71) 的 `MaxBitRate` 等）在 Native API 链上读不到 player
+- 前端转码走的是 Subsonic 的 `getTranscodeDecision` / `getTranscodeStream` 端点（见 [decisionService.js resolveStreamUrl](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/transcode/decisionService.js#L85-L91) 和 [fetchDecision.js](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/transcode/fetchDecision.js#L1-L23)），这两个端点在 Subsonic 链上挂载了 `getPlayer(api.players)` 中间件（[subsonic/api.go#L166-L190](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/api.go#L166-L190)），因此**前端播放器的转码决策与流请求每次都会经过 Subsonic 的 getPlayer → players.Register**，player 记录是通过这些 Subsonic 调用创建/更新的，而不是 Native API
+- 播放报告（`reportPlayback`）同样走 Subsonic 链（[media_annotation.go](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/media_annotation.go#L212-L268)），也会触发 getPlayer，player 由此被注册并维持 `LastSeen`
 
 ### 5.6 用户属性 (UserProps) 的持久化
 
@@ -456,9 +477,80 @@ Native API 的四个端点：
 **登出行为**：`authProvider.logout()` 调用 `removeItems()` 仅清除上表中的认证相关条目（不含 `locale` 和 `defaultView`）。但如 1.2 节所述，Redux `USER_LOGOUT` 会触发 store.subscribe，将各子 reducer 初始值写回 `localStorage.state`。
 
 [httpClient.js](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/dataProvider/httpClient.js) 在每次 HTTP 请求中：
-- 从 `localStorage` 读取 JWT token 附加到 `X-ND-Authorization` 头
+- 从 `localStorage` 读取 JWT token 附加到 `X-ND-Authorization: Bearer ...` 头
 - 附加 `X-ND-Client-Unique-Id` 头（UUID，页面加载时生成）
-- 从响应头中检查并更新 JWT token（自动刷新）
+- 在响应处理中读取新 token 并落盘
+
+#### JWT Token 续命与落盘机制
+
+JWT 的续命在前后端两侧协同完成：
+
+**后端 — JWTRefresher 中间件**：
+
+[server/auth.go JWTRefresher](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/auth.go#L274-L293) 挂载在 Native API（[native_api.go#L65](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/native_api.go#L65)）和根路由（[server/server.go#L192](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/server.go#L192)）的受保护路由上：
+
+```go
+token, _, err := jwtauth.FromContext(ctx)
+if err != nil { next.ServeHTTP(w, r); return }
+newTokenString, err := auth.TouchToken(token)    // 重新签发：相同 claim，expiry 续期
+w.Header().Set(consts.UIAuthorizationHeader, newTokenString)  // "X-ND-Authorization"
+```
+
+- 每一个经过 JWTRefresher 的请求（只要携带合法 JWT）都会触发 `TouchToken` 重签一个新的 token，写入响应头 `X-ND-Authorization`。
+- 若 `TouchToken` 失败（如 token 已过期），返回 `401 Not authenticated`。
+
+**前端 — httpClient 响应拦截落盘**：
+
+[httpClient.js#L22-L33](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/dataProvider/httpClient.js#L22-L33)：
+
+```js
+return fetchUtils.fetchJson(url, options).then((response) => {
+  const token = response.headers.get(customAuthorizationHeader)  // "X-ND-Authorization"
+  if (token) {
+    const decoded = jwtDecode(token)
+    localStorage.setItem('token', token)
+    localStorage.setItem('userId', decoded.uid)
+    config.firstTime = false
+    removeHomeCache()
+  }
+  return response
+})
+```
+
+- 只要响应头里有 `X-ND-Authorization`，就解码取 `uid`，将新 token + userId 写回 localStorage。
+- 同时设置 `config.firstTime = false`（避免登出后又弹创建管理员对话框）并清除首页缓存。
+
+这套机制意味着：只要用户持续操作（或有任何 Native API 请求），JWT 就会不断续命，实际会话时长远大于 token 原始 TTL。
+
+#### onAudioEnded 触发 keepalive 请求
+
+[Player.jsx onAudioEnded](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/audioplayer/Player.jsx#L363-L378) 在报告完 stopped 后还会主动调用 `/keepalive`：
+
+```js
+dataProvider
+  .getOne('keepalive', { id: info.trackId })
+  .catch((e) => console.log('Keepalive error:', e))
+```
+
+这个请求会走 Native API → JWTRefresher 链路，因此**每首歌播放完毕都会触发一次 JWT 续命**。对应后端 handler 在 [native_api.go addKeepAliveRoute](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/native_api.go#L240-L244)，返回 `{"response":"ok", "id":"keepalive"}`，其主要副作用就是通过 JWTRefresher 续签 token。
+
+#### onAudioError 触发 invalidateAll + 重新预取
+
+[Player.jsx onAudioError](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/audioplayer/Player.jsx#L386-L406)：
+
+```js
+decisionService.invalidateAll()    // 清空所有转码决策缓存（应对过期 token / stale URL）
+// 对当前位置之后最多 3 首歌重新发起 getTranscodeDecision 请求，用新 token
+const nextSongIds = playerState.queue
+  .slice(currentIdx + 1, currentIdx + 4)
+  .filter((item) => !item.isRadio)
+  .map((item) => item.trackId)
+if (nextSongIds.length > 0) {
+  decisionService.prefetchDecisions(nextSongIds)
+}
+```
+
+[decisionService invalidateAll](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/transcode/decisionService.js#L69-L71) 就是 `cache.clear()`。该服务的转码决策缓存条目以 JWT `exp` 时间（减 60 秒缓冲）作为新鲜度判断（[isFresh](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/transcode/decisionService.js#L23-L28)），当流请求报 401 或 URL 里的 transcodeParams 过期时就会触发 onAudioError，走 invalidateAll → 重新 prefetchDecisions 的恢复路径。
 
 ---
 
@@ -559,6 +651,7 @@ Native API 的四个端点：
 | USER_LOGOUT 会将偏好写回初始值 | [createAdminStore.js#L55-L71](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/store/createAdminStore.js#L55-L71) | 登出后再登录，主题、库选择、音量等偏好可能丢失（取决于 reducer 初始值 vs 之前保存值的时序） |
 | 页面卸载 keepalive 请求退化为 URL 参数认证 | [subsonic/index.js#L50-L58](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/subsonic/index.js#L50-L58) | 依赖 `u/t/s` Subsonic 参数，若 subsonic token 过期则页面卸载时 stopped 报告可能失败 |
 | **Native API `/api/queue` changed_by 恒空** | [nativeapi/native_api.go#L63-L66](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/native_api.go#L63-L66) + [nativeapi/queue.go#L63-L67](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/queue.go#L63-L67) | Native API 中间件链不注入 Client，前端保存/更新队列时 `changed_by` 永远为空字符串，与 Subsonic API 不对称 |
+| **Native API 无 player 注册** | [native_api.go#L63-L66](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/native_api.go#L63-L66) vs [subsonic/api.go#L99-L233](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/api.go#L99-L233) | `players.Register` 仅在 Subsonic `getPlayer` 中间件中调用，Native API 请求的 context 没有 Player/Transcoding。前端依赖 player 的转码与播放报告走 Subsonic 端点绕开，但若其他 Native API 需要 player 配置（如 MaxBitRate、ScrobbleEnabled）则读不到默认值 |
 | 转码决策解析失败时回落到非转码 URL | [playerReducer.js#L238-L241](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/reducers/playerReducer.js#L238-L241) | 带宽受限场景下可能意外播放无损/高码率文件 |
 
 ---
@@ -582,3 +675,9 @@ Navidrome 的偏好与状态同步机制具有以下特点：
 7. **两套播放队列接口 ChangedBy 不对称**：Native API (`/api/queue`) 的 `saveQueue`/`updateQueue` 和 Subsonic API (`/rest/savePlayQueue*`) 的 `SavePlayQueue`/`SavePlayQueueByIndex` 虽然均在 handler 中读取 `request.ClientFrom(ctx)` 作为 `ChangedBy`，但 Native API 中间件链不注入 Client，导致实际写入空字符串；仅 Subsonic API 能正确写入 `"NavidromeUI"`（或第三方 Subsonic 客户端名称）。
 
 8. **播放报告的后端语义**：`starting` 建立会话、`playing/paused` 更新会话、`stopped` 达到阈值（50% 或 240 秒）时触发 `incPlay`（递增歌曲/专辑/艺人播放计数，写入 scrobble 历史）并向已授权 scrobbler 分发；过期会话自动标记为 `expired` 但不触发 scrobble。
+
+9. **JWT 续命机制**：`JWTRefresher` 中间件在每个受保护请求上调用 `auth.TouchToken` 重签新 JWT，写入响应头 `X-ND-Authorization`；前端 `httpClient` 读到该 header 后重新 `jwtDecode` 取 `uid`，将新 token + userId 写回 localStorage，同时设置 `config.firstTime = false` 并清除首页缓存。只要用户持续访问（包括 `onAudioEnded` 触发的 `/keepalive` 请求），JWT 就会不断续命。
+
+10. **播放器 token/URL 错误自愈**：`onAudioError` 时调用 `decisionService.invalidateAll()` 清空全部转码决策缓存，并对后续 3 首歌重新 `prefetchDecisions`，用 fresh token 重新获取 `getTranscodeDecision`。decisionService 的缓存条目以 JWT `exp` 减 60 秒缓冲作为新鲜度阈值。
+
+11. **players.Register 仅在 Subsonic 链触发**：前端 Native API 中间件链不调用 `getPlayer`，只有 Subsonic API 的每个受保护端点会经过 `getPlayer(api.players)` 中间件触发 `players.Register`。因此 player 记录的创建和 `LastSeen` 维护是靠转码决策（`getTranscodeDecision`）、流（`getTranscodeStream`/`stream`）和播放报告（`reportPlayback`）等 Subsonic 调用完成的，与 Native API 无关。player ID cookie 命名为 `nd-player-<hex encoding of username>`（Go `%x` 格式化），不是 hash。
