@@ -29,9 +29,9 @@ const store = createStore(resettableAppReducer, persistedState, ...)
 - ⚠️ **savedPlayIndex=0 的边界问题**：代码使用 `if (persistedState?.player?.savedPlayIndex)`，当 `savedPlayIndex === 0` 时该判断为 falsy，不会将 `playIndex` 设为 0。而 `PLAYER_REFRESH_QUEUE` reducer 使用 `savedPlayIndex >= 0` 判断可以正确处理 0。因此**从 localStorage 恢复时，如果上次停在第 1 首歌（index=0），`playIndex` 将不会被立即设置，只有当 `refreshQueue` 被 dispatch 后才会被设回 0**。
 - 用户登出时（`USER_LOGOUT` action），`resettableAppReducer` 接收 `undefined` 作为 state，触发所有子 reducer 返回其初始值。
 
-### 1.2 状态保存策略（节流间隔与登出写入）
+### 1.2 状态保存策略（节流参数位置错误与登出写入）
 
-[createAdminStore.js](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/store/createAdminStore.js#L55-L71) 中使用 `lodash.throttle`（**1000ms** 默认 leading+trailing）包装 `store.subscribe` 回调：
+[createAdminStore.js](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/store/createAdminStore.js#L55-L71) 中存在**参数位置错误**：
 
 ```js
 store.subscribe(
@@ -52,6 +52,10 @@ store.subscribe(
   1000,
 )
 ```
+
+⚠️ **节流几乎完全失效**：Redux `store.subscribe(listener)` 只接受**一个**参数（listener 函数），这里的 `1000` 作为第二个参数被 `store.subscribe` **直接丢弃**，不会传给 `throttle`。而 `throttle(() => {...})` 只传了函数没传 wait，lodash `throttle` 的 wait 缺省为 `0`，即**几乎不节流**——每次 Redux state 变化都会立即触发 `JSON.stringify` 与 `localStorage.setItem`。
+
+**开发模式下的序列化开销放大**：[createAdminStore.js#L33-L41](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/store/createAdminStore.js#L33-L41) 在开发模式启用了 Redux DevTools，并配置 `trace: true, traceLimit: 25`，每次 action 都会采集 25 帧调用栈。当节流失效时，每次播放进度变化、音量调节等高频 action 都会叠加：**DevTools trace 采集 + JSON.stringify 全量序列化 + localStorage 写入**，形成显著的 CPU 开销。
 
 ⚠️ **登出后 localStorage 写入**：当 `USER_LOGOUT` 被 dispatch，`resettableAppReducer` 返回所有子 reducer 的初始值，store 状态变为初始值树。`store.subscribe` 会触发 throttle 包装的回调，将初始值序列化写入 `localStorage.state`。例如 `player.savedPlayIndex` 会被写回默认值 `0`，`player.queue` 会被写回 `[]`。因此登出操作**实际上会覆盖 localStorage.state**（将其重置为各子 reducer 的初始状态），而 authProvider 的 `removeItems()` 仅清除认证相关条目。
 
@@ -332,32 +336,53 @@ const makeMusicSrc = (trackId) =>
 ```
 `musicSrc` 是一个函数（navidrome-music-player 支持函数作为延迟解析的 URL），当播放器实际请求音频时才调用。若 `resolveStreamUrl`（含转码决策请求）失败，`.catch` 回落到非转码直链。此外，当 `onAudioError` 发生时，[Player.jsx](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/audioplayer/Player.jsx#L386-L406) 会调用 `decisionService.invalidateAll()` 清空决策缓存，并重新预取后续歌曲的决策。
 
-### 5.3 后端播放队列持久化
+### 5.3 后端播放队列持久化（ChangedBy 不对称）
 
-后端提供两套 API 保存/恢复播放队列，两者的 `ChangedBy` 字段**对称地**均取自 `request.ClientFrom(ctx)`（即 Subsonic `c` 参数，前端为 `"NavidromeUI"`）：
+后端提供两套 API 保存/恢复播放队列，但两者 `ChangedBy` 的来源**完全不对称**：Native API 链上没有注入 `Client`，导致 `changed_by` 恒为空字符串。
 
-#### Native API (`/api/queue`)
+#### Native API (`/api/queue`) — changed_by 恒空
 
-[nativeapi/queue.go](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/queue.go#L184-L191) 注册了四个端点：
+[nativeapi/native_api.go routes()](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/native_api.go#L56-L98) 中受保护路由组挂载的中间件链为：
 
-| 方法 | 路径 | Handler | ChangedBy | 说明 |
-|------|------|---------|-----------|------|
+```
+server.Authenticator(api.ds)
+  → server.JWTRefresher
+  → server.UpdateLastAccessMiddleware(api.ds)
+  → 各业务 handler（含 addQueueRoute）
+```
+
+这三个中间件**均不调用** `request.WithClient(ctx, ...)`。代码库中唯一调用 `request.WithClient` 的是 [subsonic/middlewares.go checkRequiredParameters](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/middlewares.go#L92)，仅存在于 Subsonic API 链。
+
+因此 [queue.go extractUserAndClient](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/queue.go#L63-L67) 中：
+
+```go
+func extractUserAndClient(ctx context.Context) (model.User, string) {
+    user, _ := request.UserFrom(ctx)
+    client, _ := request.ClientFrom(ctx)   // client 永远是空字符串 ""
+    return user, client
+}
+```
+
+Native API 的四个端点：
+
+| 方法 | 路径 | Handler | 实际 ChangedBy | 说明 |
+|------|------|---------|--------------|------|
 | GET | `/api/queue` | `getQueue` | - | 获取当前用户播放队列 |
-| POST | `/api/queue` | `saveQueue` | `client` | 整体替换保存队列 |
-| PUT | `/api/queue` | `updateQueue` | `client` | 部分更新队列（可只更新 ids / current / position） |
+| POST | `/api/queue` | `saveQueue` | `""`（空字符串） | 整体替换保存队列 |
+| PUT | `/api/queue` | `updateQueue` | `""`（空字符串） | 部分更新队列 |
 | DELETE | `/api/queue` | `clearQueue` | - | 清空队列 |
 
-`saveQueue` 与 `updateQueue` 的 `ChangedBy` 字段均由 `extractUserAndClient(ctx)` → `request.ClientFrom(ctx)` 提供。
+测试用例（如 [queue_test.go 第39行](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/queue_test.go#L39)）中需要**手动** `request.WithClient(ctx, "TestClient")` 才能断言 `ChangedBy`，侧面印证生产链路上不会注入 Client。
 
 #### Subsonic API (`/rest/savePlayQueue`, `/rest/getPlayQueue`)
 
-[bookmarks.go](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/bookmarks.go) 提供兼容 Subsonic 协议的播放队列 API：
+[bookmarks.go](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/bookmarks.go) 走 Subsonic 中间件链，其中 `checkRequiredParameters` 会从 URL 参数 `c` 解析并注入 Client：
 
-- `SavePlayQueue`: 通过 `current` ID（歌曲 ID）指定当前曲目，`ChangedBy = client`（[第129行](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/bookmarks.go#L129)）
-- `SavePlayQueueByIndex`: 通过 `currentIndex`（整数索引）指定当前曲目，`ChangedBy = client`（[第204行](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/bookmarks.go#L204)）
-- `GetPlayQueue` / `GetPlayQueueByIndex`: 获取队列，响应中包含 `ChangedBy` 字段（[第99行](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/bookmarks.go#L99)、[第172行](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/bookmarks.go#L172)）
+- `SavePlayQueue`: `ChangedBy = client`（[第129行](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/bookmarks.go#L129)）
+- `SavePlayQueueByIndex`: `ChangedBy = client`（[第204行](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/bookmarks.go#L204)）
+- `GetPlayQueue` / `GetPlayQueueByIndex`: 响应中返回 `ChangedBy` 字段（[第99行](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/bookmarks.go#L99)、[第172行](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/subsonic/bookmarks.go#L172)）
 
-两套接口写入和读取 `ChangedBy` 完全对称，使用相同的 `client`（Subsonic `c` 参数）。
+**总结**：两套接口在写入时均读取 `request.ClientFrom(ctx)` 作为 `ChangedBy`，但由于 Native API 链上从未注入 Client，导致实际值不对称——Subsonic API 写入 `"NavidromeUI"`（或第三方 Subsonic 客户端名称），Native API 写入空字符串。读取时两者都能正确返回已落库的 `ChangedBy` 值。
 
 #### 数据库持久化
 
@@ -469,8 +494,9 @@ const makeMusicSrc = (trackId) =>
 │  │    settings: { notifications: true, toggleableFields: {}, omittedFields: {} } │
 │  │  }                                                       │     │
 │  └─────────────────────────────────────────────────────────┘     │
-│    ↑ 每 1000ms throttle (lodash.throttle 默认 leading+trailing)  │
-│    ↑ USER_LOGOUT 触发后会写回各 reducer 初始值（覆盖）            │
+│    ↑ ⚠️ throttle 参数位置错误 — 1000ms 被丢弃，wait 缺省 0 几乎不节流 │
+│    ↑ 每次 Redux 状态变化都会触发 JSON.stringify + localStorage 写入 │
+│    ↑ USER_LOGOUT 触发后会写回各 reducer 初始值（覆盖）              │
 │                                                                  │
 │  ┌──────────────────────┐  ┌─────────────────────────┐          │
 │  │  localStorage keys:  │  │  localStorage keys:     │          │
@@ -508,7 +534,8 @@ const makeMusicSrc = (trackId) =>
 │  │  user_agent  │  │  position     │  │  (Last.fm session,     │  │
 │  │  transcoding │  │  items (CSV)  │  │   ListenBrainz token,  │  │
 │  │  max_bit_rate│  │  changed_by   │  │   ...)                 │  │
-│  │  scrobble    │  │  (client)     │  │                        │  │
+│  │  scrobble    │  │  Subsonic="NavidromeUI" │  │                 │  │
+│  │              │  │  NativeAPI=""  │  │                        │  │
 │  └─────────────┘  └──────────────┘  └────────────────────────┘  │
 │                                                                  │
 │  scrobbler.PlayTracker:                                           │
@@ -524,11 +551,14 @@ const makeMusicSrc = (trackId) =>
 
 | 问题 | 位置 | 影响 |
 |------|------|------|
+| **节流参数位置错误，几乎不节流** | [createAdminStore.js#L55-L71](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/store/createAdminStore.js#L55-L71) | `store.subscribe` 只接收 listener，`1000` 被丢弃；`throttle(fn)` wait 缺省 0，每次 Redux 状态变化立即序列化 + 写入 localStorage |
+| **dev 模式序列化开销叠加** | [createAdminStore.js#L33-L41](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/store/createAdminStore.js#L33-L41) | 节流失效 + `trace: true, traceLimit: 25`，每次高频 action（播放进度、音量等）叠加 DevTools 栈采集 + JSON.stringify + localStorage 写入，显著 CPU 开销 |
 | `savedPlayIndex === 0` 在 store 创建时不恢复为 `playIndex` | [createAdminStore.js#L44](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/store/createAdminStore.js#L44) | 若恰好停在第一首歌，`playIndex` 不会立即赋值，需等 `refreshQueue` 才能修正 |
 | `loadState`/`saveState` 静默吞异常 | [persistState.js](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/store/persistState.js) | localStorage 损坏或隐私模式下状态丢失，无任何日志 |
 | 无 `storage` 事件监听 | 整个 `ui/src` | 多标签页打开时偏好/队列变化互不可见 |
 | USER_LOGOUT 会将偏好写回初始值 | [createAdminStore.js#L55-L71](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/store/createAdminStore.js#L55-L71) | 登出后再登录，主题、库选择、音量等偏好可能丢失（取决于 reducer 初始值 vs 之前保存值的时序） |
 | 页面卸载 keepalive 请求退化为 URL 参数认证 | [subsonic/index.js#L50-L58](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/subsonic/index.js#L50-L58) | 依赖 `u/t/s` Subsonic 参数，若 subsonic token 过期则页面卸载时 stopped 报告可能失败 |
+| **Native API `/api/queue` changed_by 恒空** | [nativeapi/native_api.go#L63-L66](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/native_api.go#L63-L66) + [nativeapi/queue.go#L63-L67](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/server/nativeapi/queue.go#L63-L67) | Native API 中间件链不注入 Client，前端保存/更新队列时 `changed_by` 永远为空字符串，与 Subsonic API 不对称 |
 | 转码决策解析失败时回落到非转码 URL | [playerReducer.js#L238-L241](file:///d:/fz/0601-1/solo-dogfeeding/code/60-navidrome/ui/src/reducers/playerReducer.js#L238-L241) | 带宽受限场景下可能意外播放无损/高码率文件 |
 
 ---
@@ -549,6 +579,6 @@ Navidrome 的偏好与状态同步机制具有以下特点：
 
 6. **Client vs ClientUniqueId 分层**：`Client`（Subsonic `c` 参数）标识客户端类型，用于 `player` 表匹配和 `playqueue.ChangedBy`；`ClientUniqueId`（每次页面加载的 UUID）用于区分同一用户的不同标签页/浏览器实例，是 `PlayTracker.playMap` 的 key。
 
-7. **两套播放队列接口 ChangedBy 对称**：Native API (`/api/queue`) 的 `saveQueue`/`updateQueue` 和 Subsonic API (`/rest/savePlayQueue*`) 的 `SavePlayQueue`/`SavePlayQueueByIndex` 均使用 `request.ClientFrom(ctx)` 作为 `ChangedBy`，读取时也都返回此字段。
+7. **两套播放队列接口 ChangedBy 不对称**：Native API (`/api/queue`) 的 `saveQueue`/`updateQueue` 和 Subsonic API (`/rest/savePlayQueue*`) 的 `SavePlayQueue`/`SavePlayQueueByIndex` 虽然均在 handler 中读取 `request.ClientFrom(ctx)` 作为 `ChangedBy`，但 Native API 中间件链不注入 Client，导致实际写入空字符串；仅 Subsonic API 能正确写入 `"NavidromeUI"`（或第三方 Subsonic 客户端名称）。
 
 8. **播放报告的后端语义**：`starting` 建立会话、`playing/paused` 更新会话、`stopped` 达到阈值（50% 或 240 秒）时触发 `incPlay`（递增歌曲/专辑/艺人播放计数，写入 scrobble 历史）并向已授权 scrobbler 分发；过期会话自动标记为 `expired` 但不触发 scrobble。
