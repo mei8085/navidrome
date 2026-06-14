@@ -700,7 +700,7 @@ func (m *Manager) updatePluginSettings(ctx, id string, updateFn func(*model.Plug
     updateFn(plugin)
     plugin.UpdatedAt = time.Now()
 
-    // 2. 权限不足时自动禁用插件（先写回DB，再卸载）
+    // 2. 权限不足时自动禁用插件（先卸载，再写回DB）
     if manifest.Permissions.Users != nil && !hasValidUsersConfig(...) {
         if wasEnabled {
             _ = m.unloadPlugin(id)  // 先卸载
@@ -1017,6 +1017,347 @@ func (m *Manager) UpdatePluginUsers(ctx, id, usersJSON string, allUsers bool) er
 func (m *Manager) UpdatePluginLibraries(ctx, id, librariesJSON string, ...) error { ... }
 ```
 
+### 4.5.4 插件重载到底重建什么：完整链路详解
+
+插件重载（`loadPluginWithConfig`）并非简单地"重启一个实例"，而是涉及 **10 个步骤**的完整重建链路，从配置解析到 WASM 编译再到能力检测。以下是逐阶段对照代码的详解：
+
+[manager_loader.go:70-L180](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_loader.go#L70-L180)
+
+---
+
+#### 阶段 1：配置 JSON 解析（parsePluginConfig）
+
+插件配置在 DB 中存为 JSON 字符串，但 Extism 的 Manifest.Config 要求 **所有值必须是字符串**。因此需要做一层类型适配：
+
+```go
+func parsePluginConfig(configJSON string) (map[string]string, error) {
+    var raw map[string]interface{}
+    json.Unmarshal([]byte(configJSON), &raw)
+    
+    result := make(map[string]string)
+    for k, v := range raw {
+        switch val := v.(type) {
+        case string:
+            result[k] = val  // 字符串直接保留
+        default:
+            // 非字符串值重新序列化为 JSON 字符串
+            jsonBytes, _ := json.Marshal(val)
+            result[k] = string(jsonBytes)
+        }
+    }
+    return result, nil
+}
+```
+
+> **设计意图**：Extism 的 WASM 侧只能读取字符串配置，因此布尔、数字、数组、对象等类型都需要序列化成 JSON 字符串，由插件自己反序列化使用。
+
+---
+
+#### 阶段 2：权限 JSON 数组解析
+
+分别解析用户和媒体库的权限配置：
+
+```go
+// 用户权限
+var allowedUsers []string
+if p.AllUsers {
+    allUsers = true  // 允许访问所有用户
+} else {
+    json.Unmarshal([]byte(p.Users), &allowedUsers)  // 指定用户列表
+}
+
+// 媒体库权限
+var allowedLibraries []int
+if p.AllLibraries {
+    allLibraries = true  // 允许访问所有库
+} else {
+    json.Unmarshal([]byte(p.Libraries), &allowedLibraries)  // 指定库列表
+}
+```
+
+解析结果存入 `serviceContext`，供后续 host services 构造时使用。
+
+---
+
+#### 阶段 3：打开插件包获取 Wasm 字节码 + Manifest
+
+```go
+pkg, err := OpenPluginPackage(p.Path)  // .ndp 格式（zip 压缩包）
+defer pkg.Close()
+
+wasmBytes, err := pkg.WasmBytes()  // 读取 .wasm 文件
+manifest, err := pkg.Manifest()    // 读取 manifest.json
+```
+
+---
+
+#### 阶段 4：构造 extism.Manifest
+
+这是插件运行时环境的核心配置，包含 5 类信息：
+
+```go
+extismManifest := extism.Manifest{
+    Wasm: []extism.Wasm{
+        extism.WasmData{
+            Data: wasmBytes,  // WASM 字节码
+            Hash: "",          // 可选：内容哈希
+        },
+    },
+    Config:         configMap,    // 阶段 1 解析的配置 map
+    Timeout:         uint32(consts.PluginTimeout.Seconds()),
+    AllowedHosts:    manifest.Http.RequiredHosts,  // 来自插件 manifest 声明
+    AllowedPaths:    buildAllowedPaths(...),        // 库文件系统挂载点
+}
+```
+
+**关键字段说明**：
+
+| 字段 | 来源 | 作用 |
+|------|------|------|
+| `Wasm` | 插件包内 .wasm 文件 | 实际执行的 WebAssembly 代码 |
+| `Config` | DB 中 plugin.config JSON | 插件可读取的配置键值对 |
+| `Timeout` | 常量 `PluginTimeout`（30s） | 单次调用最大执行时间，防止死循环 |
+| `AllowedHosts` | 插件 manifest.Http.RequiredHosts | 允许 HTTP 请求访问的主机白名单 |
+| `AllowedPaths` | `buildAllowedPaths()` 计算 | 允许 WASM 访问的宿主文件系统路径 |
+
+---
+
+#### 阶段 5：库权限 → 允许文件路径计算（buildAllowedPaths）
+
+`buildAllowedPaths` 根据插件的媒体库权限，计算出 WASM 可以访问的宿主文件系统路径映射表：
+
+[manager_loader.go:208-L260](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_loader.go#L208-L260)
+
+```go
+func buildAllowedPaths(perm *LibraryPermission, allowedLibraries []int, allLibraries bool) (map[string]string, error) {
+    allowedPaths := make(map[string]string)
+    libraries, _ := ds.Library(ctx).GetAll()
+    
+    for _, lib := range libraries {
+        // 权限过滤：allLibraries=true 或 在允许列表中
+        if !allLibraries && !slices.Contains(allowedLibraries, lib.ID) {
+            continue
+        }
+        
+        hostPath := filepath.Clean(lib.Path)
+        mountPoint := fmt.Sprintf("/library/%d", lib.ID)  // WASM 内挂载路径
+        
+        // 无写权限 → 加 ro: 前缀（只读）
+        if perm != nil && !perm.Write {
+            mountPoint = "ro:" + mountPoint
+        }
+        
+        allowedPaths[hostPath] = mountPoint
+    }
+    return allowedPaths, nil
+}
+```
+
+**挂载规则**：
+- **宿主路径**：媒体库的实际文件路径（如 `D:\Music`）
+- **WASM 内挂载点**：`/library/{libraryID}`（如 `/library/1`）
+- **只读标记**：无写权限时加 `ro:` 前缀，WASM 只能读不能写
+
+> **安全设计**：通过路径映射 + 只读前缀，确保插件只能访问授权的媒体库目录，无法越权访问宿主其他文件。
+
+---
+
+#### 阶段 6：按 manifest 权限重建 host functions
+
+这是插件能力边界的核心——**根据插件 manifest 中声明的权限，动态注册对应的 host 函数**。权限不足时，对应的 host 函数不会被注册，插件尝试调用会直接失败。
+
+采用**表驱动**注册模式，`hostServices` 全局表包含 12 个服务条目：
+
+[manager_loader.go:40-L150](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_loader.go#L40-L150)
+
+```go
+var hostServices = []hostServiceEntry{
+    {
+        name:          "Config",
+        hasPermission: func(p *Permissions) bool { return true },  // 始终可用
+        create: func(ctx *serviceContext) ([]extism.HostFunction, io.Closer) {
+            service := newConfigService(ctx.pluginName, ctx.config)
+            return host.RegisterConfigHostFunctions(service), nil
+        },
+    },
+    {
+        name:          "SubsonicAPI",
+        hasPermission: func(p *Permissions) bool { return p != nil && p.Subsonicapi != nil },
+        create: func(ctx *serviceContext) ([]extism.HostFunction, io.Closer) {
+            service := newSubsonicAPIService(..., ctx.allowedUsers, ctx.allUsers)
+            return host.RegisterSubsonicAPIHostFunctions(service), nil
+        },
+    },
+    {
+        name:          "Library",
+        hasPermission: func(p *Permissions) bool { return p != nil && p.Library != nil },
+        create: func(ctx *serviceContext) ([]extism.HostFunction, io.Closer) {
+            service := newLibraryService(..., ctx.allowedLibraries, ctx.allLibraries)
+            return host.RegisterLibraryHostFunctions(service), nil
+        },
+    },
+    // ... 还有 Scheduler / WebSocket / Artwork / Cache / KVStore / Users / HTTP / Task 等
+}
+```
+
+**重建流程**：
+
+```go
+var hostFunctions []extism.HostFunction
+var closers []io.Closer
+
+for _, svc := range hostServices {
+    // 权限判定：manifest 声明了该权限才注册
+    if !svc.hasPermission(manifest.Permissions) {
+        continue
+    }
+    
+    // 创建服务实例 + 注册对应的 host functions
+    fns, closer := svc.create(&serviceContext{
+        pluginName:       id,
+        manager:          m,
+        permissions:      manifest.Permissions,
+        config:           configMap,
+        allowedUsers:     allowedUsers,
+        allUsers:         allUsers,
+        allowedLibraries: allowedLibraries,
+        allLibraries:     allLibraries,
+    })
+    
+    hostFunctions = append(hostFunctions, fns...)
+    if closer != nil {
+        closers = append(closers, closer)  // 卸载时需要清理
+    }
+}
+```
+
+**12 个 Host 服务一览**：
+
+| 服务名 | 权限检查 | 作用 |
+|--------|----------|------|
+| Config | 始终可用 | 读取插件配置 |
+| SubsonicAPI | `permissions.subsonicapi` | 调用 Subsonic API |
+| Scheduler | `permissions.scheduler` | 注册定时任务 |
+| WebSocket | `permissions.websocket` | 发送 WebSocket 消息 |
+| Artwork | `permissions.artwork` | 获取专辑封面 |
+| Cache | `permissions.cache` | 使用插件级缓存 |
+| Library | `permissions.library` | 查询媒体库数据 |
+| KVStore | `permissions.kvstore` | 键值存储持久化 |
+| Users | `permissions.users` | 查询用户信息 |
+| HTTP | `permissions.http` | 发起 HTTP 请求 |
+| Task | `permissions.task` | 后台任务管理 |
+| （持续扩展） | | |
+
+> **最小权限原则**：每个插件只能获得 manifest 中声明的权限对应的 host functions。未声明的权限对应的 host function 根本不会被注册到 WASM 运行时中，插件无法调用。
+
+---
+
+#### 阶段 7：wazero RuntimeConfig 构造
+
+配置底层 WASM 运行时（wazero）的编译缓存和运行行为：
+
+```go
+runtimeConfig := wazero.NewRuntimeConfig().
+    WithCloseOnContextDone(true).  // 上下文取消时自动关闭
+    WithCompilationCache(cache)    // 编译缓存（复用已编译模块）
+
+// 实验性线程支持（需要 manifest 声明）
+if manifest.Threads {
+    runtimeConfig = runtimeConfig.WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesThreads)
+}
+```
+
+---
+
+#### 阶段 8：编译（NewCompiledPlugin）
+
+这是最重的一步：将 WASM 字节码编译为可执行的机器码，同时注册所有 host functions。
+
+```go
+compiledPlugin, err := extism.NewCompiledPlugin(ctx, extismManifest, runtimeConfig, hostFunctions)
+```
+
+> **性能注意**：编译是耗时操作，因此配置变更时通过 `unloadPlugin` → `loadPluginWithConfig` 完整重建，而不是尝试"热更新"单个函数。
+
+---
+
+#### 阶段 9：能力检测（detectCapabilities）
+
+创建一个临时实例，扫描插件导出的所有函数，识别其支持的能力：
+
+```go
+tempInstance, _ := compiledPlugin.Instance()
+defer tempInstance.Close()
+
+capabilities, err := detectCapabilities(tempInstance)  // 扫描导出函数
+manifest.ValidateWithCapabilities(capabilities)        // 校验 manifest 声明与实际能力一致
+```
+
+---
+
+#### 阶段 10：注册 + 初始化
+
+编译后的插件存入内存 map，并调用插件的初始化函数：
+
+```go
+p := &plugin{
+    name:           id,
+    path:           pluginPath,
+    manifest:       manifest,
+    compiled:       compiledPlugin,
+    capabilities:   capabilities,
+    closers:        closers,           // host services 清理句柄
+    allowedUserIDs: allowedUsers,
+    allUsers:       allUsers,
+    libraries:      libraryAccess{...},  // O(1) 库权限查找
+}
+
+m.plugins[id] = p
+m.callPluginInit(p)  // 调用插件导出的 _start / _initialize 函数
+```
+
+---
+
+**plugin 结构体全貌**：
+
+[manager_plugin.go:15-L50](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_plugin.go#L15-L50)
+
+```go
+type plugin struct {
+    name           string
+    path           string
+    manifest       *Manifest          // 插件声明的元数据
+    compiled       *extism.CompiledPlugin  // 编译后的 WASM 模块（可复用创建实例）
+    capabilities   []Capability       // 检测到的能力
+    closers        []io.Closer        // host services 清理句柄
+    metrics        PluginMetricsRecorder
+    allowedUserIDs []string
+    allUsers       bool
+    libraries      libraryAccess      // O(1) 库权限查找
+}
+```
+
+> **关键理解**：`CompiledPlugin` 是编译后的模块，可以快速创建多个实例（轻量级）。因此"重载"的代价主要在编译阶段，实例创建是廉价的。
+
+---
+
+**重载重建清单总结**：
+
+每次 `loadPluginWithConfig` 调用都会完整重建以下内容：
+
+| 重建项 | 说明 | 代价 |
+|--------|------|------|
+| 配置 map | JSON → `map[string]string` 转换 | 低 |
+| 权限列表 | users/libraries JSON 数组解析 | 低 |
+| Manifest | Extism 运行时配置（Wasm/Config/Timeout/AllowedHosts/AllowedPaths） | 低 |
+| AllowedPaths | 库权限 → 文件路径映射计算 | 低 |
+| Host Functions | 按权限遍历 12 个服务，生成 host function 列表 | 中 |
+| RuntimeConfig | wazero 运行时配置 + 编译缓存 | 低 |
+| CompiledPlugin | WASM 字节码编译为机器码 | **高**（CPU 密集） |
+| Capabilities | 导出函数扫描 + manifest 校验 | 中 |
+| Closers | 各 host service 的清理句柄 | 低 |
+| plugin 实体 | 内存中的插件结构体（存入 m.plugins map） | 低 |
+
 ### 4.6 Dev/调试只读配置接口
 
 仅在 `DevUIShowConfig=true` 时启用的 GET 接口（**只读**，无 PUT/POST）：
@@ -1122,7 +1463,7 @@ func (b *broker) SendMessage(ctx context.Context, evt Event) {
 
 **反压策略 1.5：订阅/退订阻塞调用方**
 
-`susbcribing` 和 `unsubscribing` 通道的缓冲均为 1，同样采用**阻塞写入**（无 select+default）：
+`subscribing` 和 `unsubscribing` 通道的缓冲均为 1，同样采用**阻塞写入**（无 select+default）：
 
 [sse.go:168-L194](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/events/sse.go#L168-L194)
 
@@ -1314,6 +1655,103 @@ if s.changesDetected {
     s.broker.SendBroadcastMessage(ctx, &events.RefreshResource{})  // 全量刷新
 }
 ```
+
+#### 5.4.1 Scanner 扫描结束 RefreshResource 的判定与广播范围
+
+扫描结束时是否发送 `RefreshResource` 事件，由 `changesDetected` 标志位决定。这是一个贯穿整个扫描流程的**原子布尔值**，各阶段发现变更时会将其置为 `true`。
+
+##### 判定逻辑总览
+
+整个判定链路分为三层：
+
+```
+scanState.changesDetected (scanner.go 内部，atomic.Bool)
+        ↓ 各阶段设置
+trackProgress() 收集 → s.changesDetected (controller 层，普通 bool)
+        ↓ 扫描结束时判定
+SendBroadcastMessage(RefreshResource{})
+```
+
+##### 第一层：scanState 内的变更标记（atomic.Bool）
+
+[scanner.go:30-L69](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/scanner/scanner.go#L30-L69)
+
+```go
+type scanState struct {
+    // ...
+    changesDetected atomic.Bool  // 原子布尔，各阶段并发安全设置
+}
+
+// 全量扫描直接设为 true（强制刷新）
+if fullScan {
+    state.changesDetected.Store(true)
+}
+```
+
+**关键规则**：**全量扫描时 `changesDetected` 初始值就是 `true`**，确保所有维护操作都会执行，前端一定会收到刷新事件。增量扫描初始为 `false`，只有检测到实际变更才置为 `true`。
+
+##### 第二层：各阶段检测到变更时置位
+
+以下阶段会检测变更并设置 `changesDetected = true`：
+
+| 阶段 | 触发条件 | 代码位置 |
+|------|----------|----------|
+| 阶段 1（加载媒体文件） | 检测到新增/修改/删除的文件 | `phase_1_scan.go` |
+| 阶段 2（元数据提取） | 专辑/歌曲元数据发生变化 | `phase_2_metadata.go` |
+| 阶段 4（播放列表导入） | 播放列表刷新数量 > 0 | [phase_4_playlists.go:124](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/scanner/phase_4_playlists.go#L124) |
+| ...（其他阶段） | 检测到数据变更 | 各 phase 的 `finalize()` |
+
+以播放列表阶段为例：
+
+```go
+func (p *phasePlaylists) finalize(err error) error {
+    refreshed := p.refreshed.Load()
+    if refreshed > 0 {
+        p.scanState.changesDetected.Store(true)  // 有刷新 → 标记变更
+    }
+    return err
+}
+```
+
+##### 第三层：controller 收集并最终判定
+
+[controller.go:271-L310](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/scanner/controller.go#L271-L310)
+
+`trackProgress()` 函数在扫描过程中持续接收进度消息，其中 `ChangesDetected` 标志位会汇总到 controller 层：
+
+```go
+func (s *controller) trackProgress(ctx context.Context, progress <-chan *ProgressInfo) {
+    s.changesDetected = false  // 初始为 false
+    
+    for p := range pl.ReadOrDone(ctx, progress) {
+        if p.ChangesDetected {  // 收到变更通知
+            s.changesDetected = true
+            continue
+        }
+        // ... 处理其他进度消息
+    }
+}
+```
+
+扫描结束后，在 `Rescan()` 函数中做最终判定：
+
+```go
+// 如果检测到变更，向所有客户端发送刷新事件
+if s.changesDetected {
+    log.Debug(ctx, "Library changes imported. Sending refresh event")
+    s.broker.SendBroadcastMessage(ctx, &events.RefreshResource{})
+}
+```
+
+##### 广播范围
+
+**扫描结束发送的是一个空的 `RefreshResource{}`**，这意味着：
+
+- `resources` map 为空 → 在前端被解释为 **通配符 `*`**
+- 所有订阅了事件的客户端都会收到
+- **所有资源类型都需要刷新**（专辑、歌曲、艺术家、播放列表、用户等）
+
+> **设计考虑**：扫描可能导致跨多种资源类型的级联变更（如新增专辑同时涉及艺术家、歌曲、封面等），为避免细粒度追踪的复杂性，统一发送全量刷新事件，由前端决定哪些页面需要重新拉取数据。
 
 **使用示例（细粒度插件刷新）**：
 
@@ -1630,7 +2068,7 @@ export const TranscodingNote = ({ message }) => {
 
 **注意**：`MusicFolder` 在引入多库支持后已非推荐使用方式（改为 `library` 表管理，可热加载）。
 
-### 7.3 配置文件与环境变量：无运行时重载机制
+### 7.4 配置文件与环境变量：无运行时重载机制
 
 全局配置（`conf.Server`）的读取流程为：
 1. **服务启动** → `InitConfig()` → `Load()` → 填充 `conf.Server`
@@ -1671,12 +2109,17 @@ export const TranscodingNote = ({ message }) => {
 | [core/library.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/library.go) | Library 保存/更新/删除 + 路径变更副作用差异 |
 | [core/user.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/user.go) | 用户删除 → 插件级联卸载的业务编排 |
 | [plugins/manager.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager.go) | 插件生命周期、配置热重载、unloadPlugin、UnloadDisabledPlugins |
+| [plugins/manager_loader.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_loader.go) | 插件完整加载链路、extism manifest 构造、buildAllowedPaths、hostServices 表驱动注册 |
+| [plugins/manager_plugin.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_plugin.go) | plugin 结构体定义、实例创建、Close 清理 |
 | [plugins/manager_watcher.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_watcher.go) | 插件目录监听、2s 防抖、SHA256 去重 |
 | [plugins/manager_sync.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_sync.go) | 插件 DB 同步、流式 SHA256 计算 |
 | [persistence/property_repository.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/property_repository.go) | 系统属性 Upsert 实现 |
 | [persistence/user_props_repository.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/user_props_repository.go) | 用户偏好 Upsert 实现 |
 | [persistence/user_repository.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/user_repository.go) | 用户 DB 删除 + 调用 cleanupPluginUserReferences |
 | [persistence/plugin_cleanup.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/plugin_cleanup.go) | 用户/库删除时 plugin JSON 数组清理 + 自动禁用 SQL |
+| [scanner/controller.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/scanner/controller.go) | Scanner 控制器、changesDetected 收集、RefreshResource 广播判定 |
+| [scanner/scanner.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/scanner/scanner.go) | Scanner 主逻辑、scanState、全量扫描强制标记变更 |
+| [scanner/phase_4_playlists.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/scanner/phase_4_playlists.go) | 播放列表扫描阶段、changesDetected 置位示例 |
 | [consts/consts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/consts/consts.go) | PID/CoverArtSize/登录背景 URL 默认值常量 |
 | [core/agents/session_keys.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/agents/session_keys.go) | UserProps 封装（Last.fm/ListenBrainz Session） |
 | [adapters/lastfm/auth_router.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/adapters/lastfm/auth_router.go) | Last.fm 授权 API |
