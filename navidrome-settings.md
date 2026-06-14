@@ -169,11 +169,12 @@ if err := validateEnforceNonRootUser(); err != nil {
 
 此阶段先校验 `EnforceNonRootUser` 权限，避免后续文件操作在错误的用户上下文中执行。
 
-### 阶段 4：默认值补全（Defaulting）
+### 阶段 4：默认值补全与裁剪（Defaulting + Clipping）
 
-[configuration.go:344-L405](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L344-L405)
+[configuration.go:344-L461](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L344-L461)
 
 ```go
+// ---- 4a：路径与目录默认值 ----
 if Server.CacheFolder.String() == "" {
     Server.CacheFolder = NewDir(filepath.Join(Server.DataFolder.String(), "cache"))
 }
@@ -183,16 +184,63 @@ if Server.Plugins.Enabled {
             filepath.Join(Server.DataFolder.String(), "plugins"), 0700)
     }
 }
-// ... 更多默认值填充：DbPath、日志输出、BaseURL 解析
+// ... 更多默认值填充：DbPath、日志输出
+
+// ---- 4b：BaseURL 拆解 ----
+if Server.BaseURL != "" {
+    u, _ := url.Parse(Server.BaseURL)
+    Server.BasePath   = u.Path         // 仅路径部分（如 /music）
+    u.Path = ""; u.RawQuery = ""
+    Server.BaseHost   = u.Host         // 主机:端口（如 navidrome.local:4533）
+    Server.BaseScheme = u.Scheme       // http 或 https
+}
+
+// ---- 4c：外服务级联禁用 ----
+if !Server.EnableExternalServices {
+    disableExternalServices()
+}
+
+// ---- 4d：PID（Persistent ID）非空兜底 ----
+Server.PID.Album = cmp.Or(Server.PID.Album, consts.DefaultAlbumPID)
+Server.PID.Track = cmp.Or(Server.PID.Track, consts.DefaultTrackPID)
+// DefaultAlbumPID = "musicbrainz_albumid|albumartistid,album,albumversion,releasedate"
+// DefaultTrackPID = "musicbrainz_trackid|albumid,discnumber,tracknumber,title"
 ```
 
-### 阶段 5：批量校验（Validation）
+#### 4c：`disableExternalServices()` 级联禁用链路
 
-[configuration.go:384-L414](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L384-L414)
-
-使用 `run.Sequentially` 串行执行所有校验函数：
+[configuration.go:563-L574](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L563-L574)
 
 ```go
+func disableExternalServices() {
+    Server.EnableInsightsCollector   = false  // 遥测关闭
+    Server.EnableM3UExternalAlbumArt = false  // 外部专辑封面禁用
+    Server.LastFM.Enabled            = false  // Last.fm 聚合接口
+    Server.Deezer.Enabled            = false  // Deezer 元数据
+    Server.ListenBrainz.Enabled      = false  // ListenBrainz 元数据
+    Server.Agents                    = ""     // 所有外部 Agent 清空
+
+    // 仅当用户未自定义登录背景时，替换为离线内置 PNG（base64 编码）
+    if Server.UILoginBackgroundURL == consts.DefaultUILoginBackgroundURL {
+        Server.UILoginBackgroundURL = consts.DefaultUILoginBackgroundURLOffline
+    }
+}
+```
+
+> **设计意图**：`EnableExternalServices` 是**最高优先级的总开关**，置为 `false` 时会强制覆盖 6 个子开关，即使它们在配置文件中单独设为 `true` 也无效。
+
+#### 4d：PID 默认值来源
+
+PID 默认值定义在 `consts/consts.go`，在两处均设为默认值（双重保险）：
+- **Viper 默认值**：[configuration.go:842-843](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L842-L843) — `viper.SetDefault("pid.album", ...)`
+- **Load 阶段兜底**：[configuration.go:433-434](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L433-L434) — `cmp.Or` 空值回退
+
+### 阶段 5：批量校验、夹断与废弃告警
+
+[configuration.go:384-L467](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L384-L467)
+
+```go
+// ---- 5a：批量硬校验（失败即退出） ----
 err = run.Sequentially(
     validateScanSchedule,
     validateBackupSchedule,
@@ -201,14 +249,36 @@ err = run.Sequentially(
     validateMaxImageUploadSize,
     validateURL("ExtAuth.LogoutURL", Server.ExtAuth.LogoutURL),
 )
-if err != nil {
-    logFatal(err)
+if err != nil { logFatal(err) }
+
+// ---- 5b：软校验 + 自动夹断（UICoverArtSize） ----
+if Server.UICoverArtSize < 200 || Server.UICoverArtSize > 1200 {
+    newValue := max(200, min(1200, Server.UICoverArtSize))
+    log.Warn("UICoverArtSize must be between 200 and 1200, clamping",
+        "value", Server.UICoverArtSize, "newValue", newValue)
+    Server.UICoverArtSize = newValue
 }
 
-// ... 后续还有 BaseURL 解析、搜索后端归一化等
+// ---- 5c：废弃选项告警 ----
+logDeprecatedOptions("Scanner.GenreSeparators", "")            // 有替代方案
+logDeprecatedOptions("Scanner.GroupAlbumReleases", "")         // 有替代方案
+logDeprecatedOptions("SearchFullString", "Search.FullString")  // 已迁移
+// ... 更多
+
+logRemovedOptions("Spotify.ID", "Spotify.Secret")              // 已彻底删除
+
+// ---- 5d：执行初始化 Hook ----
+for _, hook := range hooks { hook() }
 ```
 
-**校验失败后的行为**：所有校验函数返回 `error`，`run.Sequentially` 遇到第一个错误即终止，`logFatal()` 打印错误并调用 `os.Exit(1)` 终止进程。
+#### 5b：`UICoverArtSize` 夹断语义
+
+| 约束 | 行为 |
+|------|------|
+| 默认值 | `consts.DefaultUICoverArtSize = 300` |
+| 合法范围 | `[200, 1200]` |
+| 越界处理 | 自动夹断到最近边界值 + `Warn` 日志 |
+| **不**触发 `logFatal` | 夹断属于"容错性修正"，程序继续启动 |
 
 ---
 
@@ -240,24 +310,75 @@ func mapDeprecatedOption(legacyName, newName string) {
 | **副作用** | 无警告日志（静默映射） | 无警告日志 |
 | **覆盖检测** | 不检测新旧键是否同时设置 | 不适用 |
 
-### 两种"废弃"语义的区别
+### 三种"废弃"语义的完整区别
 
-Navidrome 存在 **两种不同的废弃处理**，语义完全不同：
+Navidrome 实际存在 **三种不同的废弃处理**，语义完全不同：
 
-#### 语义 A：继续可用（`mapDeprecatedOption`）
+#### 语义 A：继续可用但告警（`mapDeprecatedOption` + `logDeprecatedOptions`）
 
-适用于"重命名但功能保留"的场景。旧键名仍然被识别，其值会被**复制**到新键名。
+适用于"重命名但功能保留"的场景。**两层处理协同工作**：
 
-**当前使用的映射**：
+| 步骤 | 函数 | 行为 | 执行时机 |
+|------|------|------|---------|
+| 1. 值迁移 | `mapDeprecatedOption()` | 若旧键被设置，`viper.Set(newName, oldValue)` 把旧值复制到新键 | **反序列化之前**（Load 阶段 1） |
+| 2. 输出告警 | `logDeprecatedOptions()` | 检测旧键是否存在（`os.Getenv` + `viper.InConfig`），输出 Warn 日志 | **反序列化之后**（Load 阶段 5c） |
+
+[configuration.go:469-L485](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L469-L485)
+
 ```go
+func logDeprecatedOptions(oldName, newName string) {
+    envVar := "ND_" + strings.ToUpper(strings.ReplaceAll(oldName, ".", "_"))
+    logWarning := func(oldName, newName string) {
+        if newName != "" {
+            log.Warn(fmt.Sprintf(
+                "Option '%s' is deprecated and will be ignored in a future release. Please use the new '%s'",
+                oldName, newName))
+        } else {
+            log.Warn(fmt.Sprintf(
+                "Option '%s' is deprecated and will be ignored in a future release",
+                oldName))
+        }
+    }
+    // 分别检查环境变量和配置文件
+    if os.Getenv(envVar) != "" { logWarning(envVar, newEnvVar) }
+    if viper.InConfig(oldName) { logWarning(oldName, newName) }
+}
+```
+
+**同设时 legacy 压过 new 的语义**：
+
+由于 `mapDeprecatedOption` 在反序列化前执行，且使用的是 `viper.Set()`（后写入覆盖先写入），最终生效规则为：
+
+| 场景 | 最终生效值 | 说明 |
+|------|-----------|------|
+| ✅ legacy 设置，❌ new 未设置 | legacy 的值 | 正常迁移场景 |
+| ❌ legacy 未设置，✅ new 设置 | new 的值 | 正常新写法 |
+| ✅ legacy 设置，✅ new 也设置 | **legacy 的值（压过 new）** | `mapDeprecatedOption` 后执行，Set 覆盖了之前的新键值 |
+
+> **关键差异**：如果用户同时设置了 `ReverseProxyWhitelist=old` 和 `ExtAuth.TrustedSources=new`，最终 **`ExtAuth.TrustedSources=old`**，旧值优先。Viper 原生 `RegisterAlias` 则不存在此问题（别名与原键完全等价，以优先级规则为准）。
+
+**属于语义 A 的完整映射清单**（两层都处理）：
+```go
+// 阶段 1：mapDeprecatedOption（值迁移）
 mapDeprecatedOption("ReverseProxyWhitelist", "ExtAuth.TrustedSources")
 mapDeprecatedOption("ReverseProxyUserHeader", "ExtAuth.UserHeader")
 mapDeprecatedOption("HTTPSecurityHeaders.CustomFrameOptionsValue", "HTTPHeaders.FrameOptions")
 mapDeprecatedOption("CoverJpegQuality", "CoverArtQuality")
 mapDeprecatedOption("SimilarSongsMatchThreshold", "Matcher.FuzzyThreshold")
+
+// 阶段 5c：logDeprecatedOptions（告警输出）
+logDeprecatedOptions("Scanner.GenreSeparators", "")
+logDeprecatedOptions("Scanner.GroupAlbumReleases", "")
+logDeprecatedOptions("DevEnableBufferedScrobble", "")
+logDeprecatedOptions("SearchFullString", "Search.FullString")
+logDeprecatedOptions("ReverseProxyWhitelist", "ExtAuth.TrustedSources")
+logDeprecatedOptions("ReverseProxyUserHeader", "ExtAuth.UserHeader")
+logDeprecatedOptions("HTTPSecurityHeaders.CustomFrameOptionsValue", "HTTPHeaders.FrameOptions")
+logDeprecatedOptions("CoverJpegQuality", "CoverArtQuality")
+logDeprecatedOptions("SimilarSongsMatchThreshold", "Matcher.FuzzyThreshold")
 ```
 
-#### 语义 B：已移除（`logRemovedOptions`）
+#### 语义 B：已移除，仅告警（`logRemovedOptions`）
 
 适用于"功能已彻底删除"的场景。旧键名仍会被检测到，但值会被**忽略**，仅输出警告日志。
 
@@ -268,15 +389,19 @@ func logRemovedOptions(options ...string) {
     for _, option := range options {
         envVar := "ND_" + strings.ToUpper(strings.ReplaceAll(option, ".", "_"))
         logWarning := func(option string) {
-            log.Warn(fmt.Sprintf("Option '%s' is not available anymore and will be ignored...", option))
+            log.Warn(fmt.Sprintf("Option '%s' is not available anymore and will be ignored. Please remove it from your config", option))
         }
         if viper.InConfig(option) { logWarning(option) }
         if os.Getenv(envVar) != "" { logWarning(envVar) }
     }
 }
+
+logRemovedOptions("Spotify.ID", "Spotify.Secret")
 ```
 
-此外，结构体字段上也会标记 `// Deprecated:` 注释，提示迁移方向：
+#### 语义 C：结构体字段标记（`// Deprecated:` 注释）
+
+仅为**代码层面的文档标记**，不会触发任何运行时行为。对应字段的值仍然会被正常读取。
 
 [configuration.go:162-L163](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L162-L163)
 
@@ -286,6 +411,16 @@ type scannerOptions struct {
     GroupAlbumReleases bool   // Deprecated: Use PID.Album instead
 }
 ```
+
+**三类废弃语义对比总结**：
+
+| 语义 | 值迁移 | 运行时告警 | 功能仍可用 | 典型场景 |
+|-----|-------|----------|----------|---------|
+| **A：继续可用但告警** | ✅ `mapDeprecatedOption` | ✅ `logDeprecatedOptions` | ✅ | 重命名（`ReverseProxyWhitelist` → `ExtAuth.TrustedSources`） |
+| **B：已移除** | ❌ | ✅ `logRemovedOptions` | ❌ | 功能下线（`Spotify.ID` / `Spotify.Secret`） |
+| **C：仅代码注释** | ❌ | ❌ | ✅ | 字段层提示（`GenreSeparators` → `Tags.genre.Split`） |
+
+**与 Viper `RegisterAlias` 的区别**：
 
 ---
 
@@ -759,6 +894,116 @@ func (m *Manager) unloadPlugin(name string) error {
 }
 ```
 
+### 4.5.3 用户/媒体库删除时的插件级联卸载
+
+当用户或媒体库被删除时，会触发一条完整的 **DB 清理 → 自动禁用 → 内存卸载** 级联链路。
+
+#### 用户删除级联链路
+
+[user.go:62-L76](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/user.go#L62-L76)
+
+```go
+func (r *userRepositoryWrapper) Delete(id string) error {
+    // 步骤 1：底层 DB 删除（含 plugin 用户引用清理）
+    err := r.UserRepository.(rest.Persistable).Delete(id)
+    if err != nil { return err }
+
+    // 步骤 2：从内存卸载所有因权限丢失而被自动禁用的插件
+    r.pluginManager.UnloadDisabledPlugins(r.ctx)
+    return nil
+}
+```
+
+**DB 层自动禁用逻辑**（SQLite JSON 函数处理）：
+
+[plugin_cleanup.go:7-L47](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/plugin_cleanup.go#L7-L47)
+
+```go
+func cleanupPluginUserReferences(db dbx.Builder, userID string) error {
+    // 步骤 A：从所有 plugin.users JSON 数组中移除该用户
+    _, err := db.NewQuery(`
+        UPDATE plugin
+        SET users = (
+            SELECT json_group_array(value)
+            FROM json_each(plugin.users)
+            WHERE value != {:userID}
+        ), updated_at = CURRENT_TIMESTAMP
+        WHERE EXISTS (SELECT 1 FROM json_each(plugin.users) WHERE value = {:userID})
+    `).Bind(...).Execute()
+
+    // 步骤 B：自动禁用"只剩空用户列表"的插件
+    // 条件：enabled=true AND all_users=false AND manifest.permissions.users 存在 AND users 数组为空
+    _, err = db.NewQuery(`
+        UPDATE plugin
+        SET enabled = false, updated_at = CURRENT_TIMESTAMP
+        WHERE enabled = true
+          AND all_users = false
+          AND json_extract(manifest, '$.permissions.users') IS NOT NULL
+          AND (users IS NULL OR users = '' OR users = '[]' OR json_array_length(users) = 0)
+    `).Execute()
+    return err
+}
+```
+
+**内存卸载逻辑 `UnloadDisabledPlugins()`**：
+
+[manager.go:546-L590](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager.go#L546-L590)
+
+```go
+func (m *Manager) UnloadDisabledPlugins(ctx context.Context) {
+    // 1. 从 DB 查询所有 enabled=false 的插件
+    plugins, err := repo.GetAll(model.QueryOptions{
+        Filters: squirrel.Eq{"enabled": false},
+    })
+
+    // 2. 逐个检查：仍在内存中的 → 调用 unloadPlugin()
+    var unloaded []string
+    for _, p := range plugins {
+        m.mu.RLock()
+        _, loaded := m.plugins[p.ID]
+        m.mu.RUnlock()
+
+        if loaded {
+            if err := m.unloadPlugin(p.ID); err == nil {
+                unloaded = append(unloaded, p.ID)
+            }
+        }
+    }
+
+    // 3. 有卸载 → 广播刷新事件
+    if len(unloaded) > 0 {
+        m.sendPluginRefreshEvent(ctx, unloaded...)
+    }
+}
+```
+
+**完整级联时序图（用户删除）**：
+
+```
+DELETE /api/user/{id}
+  ↓
+userRepositoryWrapper.Delete(id)
+  ↓
+1. persistence.UserRepository.Delete(id)
+   ├─ r.delete(Eq{"id": id})               // 删除 user 行
+   └─ cleanupPluginUserReferences(db, id)   // 调用 plugin_cleanup.go
+      ├─ UPDATE plugin SET users = json_group_array(...) WHERE value != userID
+      └─ UPDATE plugin SET enabled = false WHERE users 数组已空
+  ↓
+2. pluginManager.UnloadDisabledPlugins(ctx)
+   ├─ repo.GetAll(Filters: enabled=false)   // 查询所有禁用的插件
+   ├─ 对每个仍加载在 m.plugins 中的：unloadPlugin(id)
+   │   ├─ 从 m.plugins map 删除
+   │   ├─ plugin.Close()                     // 用户 Cleanup 钩子
+   │   ├─ compiled.Close(5s timeout)         // 关闭 WASM 运行时
+   │   └─ runtime.GC()
+   └─ sendPluginRefreshEvent(ctx, ...)       // 广播 RefreshResource{plugin}
+```
+
+**媒体库删除的级联链路**与用户删除完全对称（[library.go:279-L281](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/library.go#L279-L281) + [plugin_cleanup.go:49-L86](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/plugin_cleanup.go#L49-L86)），区别在于操作的是 `plugin.libraries` JSON 数组而非 `plugin.users`。
+
+> **关键差异**：`cleanupPluginUserReferences` / `cleanupPluginLibraryReferences` 只处理 DB 层的 `enabled=false`，不操作内存。内存卸载统一由 `UnloadDisabledPlugins()` 完成——该函数是幂等的（先读 DB 再比对内存），因此用户删除、媒体库删除、以及插件配置保存三种触发场景可以复用同一逻辑。
+
 **具体配置保存方法**：
 
 ```go
@@ -853,13 +1098,15 @@ func GetBroker() Broker {
 
 ### 5.2.1 反压与通道缓冲设计
 
-**三层缓冲架构**：
+**五层缓冲架构**（含发布/订阅/注销三类控制通道 + 两类数据通道）：
 
 | 层级 | 通道 | 缓冲大小 | 用途 | 阻塞行为 |
 |------|------|---------|------|---------|
-| 1. 发布端 | `broker.publish` | **2** | 事件生产者 → Broker 协程 | 满则阻塞 `SendMessage()` 调用方 |
-| 2. 客户端 | `client.msgC` | **1** | Broker 协程 → 单个客户端连接 | 满则**丢弃**事件（`sendOrDrop`） |
-| 3. 读取端 | `pl.ReadOrDone` 输出 | 0（无缓冲） | 客户端协程 → HTTP 写入 | 上下文取消即停止 |
+| 1a. 事件发布 | `broker.publish` | **2** | 事件生产者 → Broker 协程 | 满则**阻塞** `SendMessage()` 调用方 |
+| 1b. 新客户端注册 | `broker.subscribing` | **1** | HTTP 处理器 → Broker 协程 | 满则**阻塞** SSE 握手协程 |
+| 1c. 客户端注销 | `broker.unsubscribing` | **1** | HTTP 处理器 → Broker 协程 | 满则**阻塞** defer 中的注销 |
+| 2. 客户端数据 | `client.msgC` | **1** | Broker 协程 → 单个客户端连接 | 满则**丢弃**事件（`sendOrDrop`） |
+| 3. 读取端输出 | `pl.ReadOrDone` 输出 | 0（无缓冲） | 客户端协程 → HTTP 写入 | 上下文取消即停止 |
 
 **反压策略 1：发布端阻塞**
 
@@ -872,6 +1119,32 @@ func (b *broker) SendMessage(ctx context.Context, evt Event) {
 ```
 
 > **设计意图**：`publish` 通道缓冲仅为 2，当事件产生速度远超处理速度时，调用方会被阻塞，形成自然的反压。这适用于配置变更等低频但重要的事件，确保事件不丢失。
+
+**反压策略 1.5：订阅/退订阻塞调用方**
+
+`susbcribing` 和 `unsubscribing` 通道的缓冲均为 1，同样采用**阻塞写入**（无 select+default）：
+
+[sse.go:168-L194](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/events/sse.go#L168-L194)
+
+```go
+func (b *broker) subscribe(r *http.Request) client {
+    // ... 构造 client 对象 ...
+    b.subscribing <- c       // 缓冲=1，满则阻塞 HTTP 处理器协程
+    return c
+}
+
+func (b *broker) unsubscribe(c client) {
+    b.unsubscribing <- c     // 缓冲=1，满则阻塞 HTTP 处理器协程
+}
+```
+
+**阻塞对调用方的实际影响**：
+
+| 通道 | 调用方 | 阻塞时行为 |
+|------|--------|----------|
+| `publish` | 保存/删除配置的业务协程（扫描控制器、用户删除、库更新、插件更新等） | 业务请求被挂起，直到 Broker 消费该事件 |
+| `subscribing` | SSE HTTP 处理器协程（`ServeHTTP`） | 新客户端连接等待 Broker 确认注册，超时后由反向代理断连 |
+| `unsubscribing` | 同上（HTTP 请求结束触发 defer） | 连接关闭的清理被延迟，但实际 HTTP 响应已发送给客户端 |
 
 **反压策略 2：客户端丢弃**
 
@@ -1318,7 +1591,29 @@ export const TranscodingNote = ({ message }) => {
 | 提示卡片 | 黄色禁用提示，引导设置 `ND_ENABLETRANSCODINGCONFIG=true` 后重启 | 红色安全警告，建议用完后关闭 |
 | 表单可编辑性 | ❌ 所有字段只读 | ✅ 可编辑 `command` 等危险字段 |
 
-### 7.2 其他需要重启的配置项（隐含约束）
+### 7.2 除 EnableTranscodingConfig 外无 UI 重启提示
+
+**明确结论**：在所有需要重启才能生效的配置项中，**只有 `EnableTranscodingConfig` 提供了前端 UI 提示**。其余配置项均不提供任何 UI 层面的重启提醒：
+
+| 配置项 | UI 提示形式 | 提示位置 |
+|--------|------------|---------|
+| **`EnableTranscodingConfig`** | ✅ 完整提示卡片（`TranscodingNote` 组件） | 转码列表 / 编辑 / 只读页面顶部 |
+| `Port` / `Address` | ❌ 无 | — |
+| `LogLevel` / `LogFile` | ❌ 无 | — |
+| `DataFolder` / `CacheFolder` | ❌ 无 | — |
+| `Scanner.Enabled` / `Schedule` | ❌ 无 | — |
+| `PasswordEncryptionKey` | ❌ 无 | — |
+| `Plugins.Enabled` / `Plugins.Folder` | ❌ 无 | — |
+| `EnableExternalServices` | ❌ 无 | — |
+| `Prometheus.*` / `Jukebox.*` | ❌ 无 | — |
+
+**提示输出的分布位置**：
+
+- **`EnableTranscodingConfig`**：前端 React 组件（[TranscodingNote.jsx](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/transcoding/TranscodingNote.jsx)）
+- **其他需重启配置**：仅在启动阶段的服务端日志（`log.Warn` / `log.Info`）中输出部分警告，如废弃选项告警、越界夹断告警，但**不告知需要重启**
+- **Dev 模式配置只读接口**：仅在 `DevUIShowConfig=true` 时可查看当前值，不提示修改后需重启
+
+### 7.3 其他需要重启的配置项（隐含约束）
 
 根据代码架构分析，以下全局配置修改后 **必须重启 Navidrome**：
 
@@ -1374,11 +1669,15 @@ export const TranscodingNote = ({ message }) => {
 | [server/nativeapi/library.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/nativeapi/library.go) | 用户-库关联 API |
 | [server/nativeapi/plugin.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/nativeapi/plugin.go) | 插件配置更新 API |
 | [core/library.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/library.go) | Library 保存/更新/删除 + 路径变更副作用差异 |
-| [plugins/manager.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager.go) | 插件生命周期、配置热重载、unloadPlugin 清理流程 |
+| [core/user.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/user.go) | 用户删除 → 插件级联卸载的业务编排 |
+| [plugins/manager.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager.go) | 插件生命周期、配置热重载、unloadPlugin、UnloadDisabledPlugins |
 | [plugins/manager_watcher.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_watcher.go) | 插件目录监听、2s 防抖、SHA256 去重 |
 | [plugins/manager_sync.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_sync.go) | 插件 DB 同步、流式 SHA256 计算 |
 | [persistence/property_repository.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/property_repository.go) | 系统属性 Upsert 实现 |
 | [persistence/user_props_repository.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/user_props_repository.go) | 用户偏好 Upsert 实现 |
+| [persistence/user_repository.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/user_repository.go) | 用户 DB 删除 + 调用 cleanupPluginUserReferences |
+| [persistence/plugin_cleanup.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/plugin_cleanup.go) | 用户/库删除时 plugin JSON 数组清理 + 自动禁用 SQL |
+| [consts/consts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/consts/consts.go) | PID/CoverArtSize/登录背景 URL 默认值常量 |
 | [core/agents/session_keys.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/agents/session_keys.go) | UserProps 封装（Last.fm/ListenBrainz Session） |
 | [adapters/lastfm/auth_router.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/adapters/lastfm/auth_router.go) | Last.fm 授权 API |
 | [utils/pl/pipelines.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/utils/pl/pipelines.go) | ReadOrDone、SendOrDone 通道工具 |
