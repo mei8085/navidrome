@@ -1126,37 +1126,45 @@ extismManifest := extism.Manifest{
 
 `buildAllowedPaths` 根据插件的媒体库权限，计算出 WASM 可以访问的宿主文件系统路径映射表：
 
-[manager_loader.go:208-L260](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_loader.go#L208-L260)
+[manager_loader.go:427-L451](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_loader.go#L427-L451)
 
 ```go
-func buildAllowedPaths(perm *LibraryPermission, allowedLibraries []int, allLibraries bool) (map[string]string, error) {
-    allowedPaths := make(map[string]string)
-    libraries, _ := ds.Library(ctx).GetAll()
-    
-    for _, lib := range libraries {
-        // 权限过滤：allLibraries=true 或 在允许列表中
-        if !allLibraries && !slices.Contains(allowedLibraries, lib.ID) {
-            continue
-        }
-        
-        hostPath := filepath.Clean(lib.Path)
-        mountPoint := fmt.Sprintf("/library/%d", lib.ID)  // WASM 内挂载路径
-        
-        // 无写权限 → 加 ro: 前缀（只读）
-        if perm != nil && !perm.Write {
-            mountPoint = "ro:" + mountPoint
-        }
-        
-        allowedPaths[hostPath] = mountPoint
+func buildAllowedPaths(ctx context.Context, libraries model.Libraries, allowedLibraryIDs []int, allLibraries, allowWriteAccess bool) map[string]string {
+    allowedLibrarySet := make(map[int]struct{}, len(allowedLibraryIDs))
+    for _, id := range allowedLibraryIDs {
+        allowedLibrarySet[id] = struct{}{}
     }
-    return allowedPaths, nil
+    allowedPaths := make(map[string]string)
+    for _, lib := range libraries {
+        _, allowed := allowedLibrarySet[lib.ID]
+        if allLibraries || allowed {
+            mountPoint := toPluginMountPoint(int32(lib.ID))  // /libraries/{libID}
+            hostPath := lib.Path
+            // 无写权限 → 宿主路径加 ro: 前缀（只读）
+            if !allowWriteAccess {
+                hostPath = "ro:" + hostPath
+            }
+            allowedPaths[hostPath] = mountPoint
+        }
+    }
+    return allowedPaths
+}
+```
+
+**挂载点路径构造**（`toPluginMountPoint`）：
+
+[host_library.go:95-L97](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/host_library.go#L95-L97)
+
+```go
+func toPluginMountPoint(libID int32) string {
+    return fmt.Sprintf("/libraries/%d", libID)  // 复数 libraries
 }
 ```
 
 **挂载规则**：
-- **宿主路径**：媒体库的实际文件路径（如 `D:\Music`）
-- **WASM 内挂载点**：`/library/{libraryID}`（如 `/library/1`）
-- **只读标记**：无写权限时加 `ro:` 前缀，WASM 只能读不能写
+- **宿主路径**：媒体库的实际文件路径（如 `D:\Music`），无写权限时加 `ro:` 前缀
+- **WASM 内挂载点**：`/libraries/{libraryID}`（如 `/libraries/1`），注意是复数 `libraries`
+- **只读标记**：`ro:` 前缀加在**宿主路径**上（而非挂载点），表示该挂载为只读
 
 > **安全设计**：通过路径映射 + 只读前缀，确保插件只能访问授权的媒体库目录，无法越权访问宿主其他文件。
 
@@ -2111,6 +2119,7 @@ export const TranscodingNote = ({ message }) => {
 | [plugins/manager.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager.go) | 插件生命周期、配置热重载、unloadPlugin、UnloadDisabledPlugins |
 | [plugins/manager_loader.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_loader.go) | 插件完整加载链路、extism manifest 构造、buildAllowedPaths、hostServices 表驱动注册 |
 | [plugins/manager_plugin.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_plugin.go) | plugin 结构体定义、实例创建、Close 清理 |
+| [plugins/host_library.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/host_library.go) | 库权限 Host Service、toPluginMountPoint 挂载点构造 |
 | [plugins/manager_watcher.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_watcher.go) | 插件目录监听、2s 防抖、SHA256 去重 |
 | [plugins/manager_sync.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_sync.go) | 插件 DB 同步、流式 SHA256 计算 |
 | [persistence/property_repository.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/property_repository.go) | 系统属性 Upsert 实现 |
