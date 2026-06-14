@@ -111,10 +111,181 @@ func InitConfig(cfgFile string, loadEnvVars bool) {
 配置优先级：**环境变量 > 配置文件 > 默认值**
 
 加载时执行的额外处理：
-- **废弃选项映射**：如 `ReverseProxyWhitelist` → `ExtAuth.TrustedSources`
+- **废弃选项映射**：如 `ReverseProxyWhitelist` → `ExtAuth.TrustedSources`（详见 2.6 节）
 - **INI 格式适配**：将 `[default]` 节合并到根级别
 - **计算字段填充**：`BaseURL` 解析为 `BasePath/BaseHost/BaseScheme`
 - **Hook 调用**：通过 `AddHook()` 注册的初始化回调
+
+---
+
+## 二点五、Load 阶段延迟校验与裁剪链路
+
+`Load()` 函数在 `InitConfig()` 之后执行，负责将 Viper 中的原始配置反序列化为 `conf.Server` 结构体，并执行一系列校验和裁剪。整个流程分为 **5 个阶段**：
+
+### 阶段 1：键名规范化（前置映射）
+
+[configuration.go:318-L326](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L318-L326)
+
+```go
+func Load(noConfigDump bool) {
+    parseIniFileConfiguration()           // INI 特殊适配
+    remapEnvVarKeysFromConfig()           // 修正用户误写的 ND_ 前缀键名
+
+    // Map deprecated options to their new names for backwards compatibility
+    mapDeprecatedOption("ReverseProxyWhitelist", "ExtAuth.TrustedSources")
+    mapDeprecatedOption("ReverseProxyUserHeader", "ExtAuth.UserHeader")
+    mapDeprecatedOption("HTTPSecurityHeaders.CustomFrameOptionsValue", "HTTPHeaders.FrameOptions")
+    mapDeprecatedOption("CoverJpegQuality", "CoverArtQuality")
+    mapDeprecatedOption("SimilarSongsMatchThreshold", "Matcher.FuzzyThreshold")
+}
+```
+
+### 阶段 2：反序列化（Unmarshal）
+
+[configuration.go:328-L337](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L328-L337)
+
+```go
+err := viper.Unmarshal(&Server, viper.DecodeHook(
+    mapstructure.ComposeDecodeHookFunc(
+        mapstructure.TextUnmarshallerHookFunc(),
+        mapstructure.StringToTimeDurationHookFunc(),
+        mapstructure.StringToSliceHookFunc(","),
+    ),
+))
+```
+
+> **延迟校验策略**：先反序列化填充整个结构体，再进行校验。这是因为部分校验（如路径存在性、非 root 用户检查）需要结构体字段完整后才能进行。
+
+### 阶段 3：早期校验（Pre-validation）
+
+[configuration.go:339-L342](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L339-L342)
+
+```go
+// Validate non-root user early, before any filesystem operations
+if err := validateEnforceNonRootUser(); err != nil {
+    logFatal(err)
+}
+```
+
+此阶段先校验 `EnforceNonRootUser` 权限，避免后续文件操作在错误的用户上下文中执行。
+
+### 阶段 4：默认值补全（Defaulting）
+
+[configuration.go:344-L405](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L344-L405)
+
+```go
+if Server.CacheFolder.String() == "" {
+    Server.CacheFolder = NewDir(filepath.Join(Server.DataFolder.String(), "cache"))
+}
+if Server.Plugins.Enabled {
+    if Server.Plugins.Folder.String() == "" {
+        Server.Plugins.Folder = NewDirWithPerm(
+            filepath.Join(Server.DataFolder.String(), "plugins"), 0700)
+    }
+}
+// ... 更多默认值填充：DbPath、日志输出、BaseURL 解析
+```
+
+### 阶段 5：批量校验（Validation）
+
+[configuration.go:384-L414](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L384-L414)
+
+使用 `run.Sequentially` 串行执行所有校验函数：
+
+```go
+err = run.Sequentially(
+    validateScanSchedule,
+    validateBackupSchedule,
+    validatePlaylistsPath,
+    validatePurgeMissingOption,
+    validateMaxImageUploadSize,
+    validateURL("ExtAuth.LogoutURL", Server.ExtAuth.LogoutURL),
+)
+if err != nil {
+    logFatal(err)
+}
+
+// ... 后续还有 BaseURL 解析、搜索后端归一化等
+```
+
+**校验失败后的行为**：所有校验函数返回 `error`，`run.Sequentially` 遇到第一个错误即终止，`logFatal()` 打印错误并调用 `os.Exit(1)` 终止进程。
+
+---
+
+## 二点六、废弃选项映射：Viper Alias 行为与语义差别
+
+Navidrome 使用自定义的 `mapDeprecatedOption()` 实现废弃选项映射，**而非** Viper 原生的 `RegisterAlias`。
+
+### `mapDeprecatedOption()` 的实际行为
+
+[configuration.go:533-L539](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L533-L539)
+
+```go
+// mapDeprecatedOption is used to provide backwards compatibility for deprecated options.
+// It should be called after the config has been read by viper, but before unmarshalling.
+func mapDeprecatedOption(legacyName, newName string) {
+    if viper.IsSet(legacyName) {
+        viper.Set(newName, viper.Get(legacyName))
+    }
+}
+```
+
+**与 Viper `RegisterAlias` 的区别**：
+
+| 特性 | `mapDeprecatedOption` | Viper `RegisterAlias` |
+|------|----------------------|----------------------|
+| **时机** | 每次 `Load()` 时显式调用 | 在 Viper 初始化时注册一次 |
+| **键保留** | 旧键仍保留在 Viper 中 | 别名不会重复存储 |
+| **优先级** | 新键值会被旧键覆盖（后调用的 `Set` 生效） | 别名与原键等同优先级 |
+| **副作用** | 无警告日志（静默映射） | 无警告日志 |
+| **覆盖检测** | 不检测新旧键是否同时设置 | 不适用 |
+
+### 两种"废弃"语义的区别
+
+Navidrome 存在 **两种不同的废弃处理**，语义完全不同：
+
+#### 语义 A：继续可用（`mapDeprecatedOption`）
+
+适用于"重命名但功能保留"的场景。旧键名仍然被识别，其值会被**复制**到新键名。
+
+**当前使用的映射**：
+```go
+mapDeprecatedOption("ReverseProxyWhitelist", "ExtAuth.TrustedSources")
+mapDeprecatedOption("ReverseProxyUserHeader", "ExtAuth.UserHeader")
+mapDeprecatedOption("HTTPSecurityHeaders.CustomFrameOptionsValue", "HTTPHeaders.FrameOptions")
+mapDeprecatedOption("CoverJpegQuality", "CoverArtQuality")
+mapDeprecatedOption("SimilarSongsMatchThreshold", "Matcher.FuzzyThreshold")
+```
+
+#### 语义 B：已移除（`logRemovedOptions`）
+
+适用于"功能已彻底删除"的场景。旧键名仍会被检测到，但值会被**忽略**，仅输出警告日志。
+
+[configuration.go:487-L502](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L487-L502)
+
+```go
+func logRemovedOptions(options ...string) {
+    for _, option := range options {
+        envVar := "ND_" + strings.ToUpper(strings.ReplaceAll(option, ".", "_"))
+        logWarning := func(option string) {
+            log.Warn(fmt.Sprintf("Option '%s' is not available anymore and will be ignored...", option))
+        }
+        if viper.InConfig(option) { logWarning(option) }
+        if os.Getenv(envVar) != "" { logWarning(envVar) }
+    }
+}
+```
+
+此外，结构体字段上也会标记 `// Deprecated:` 注释，提示迁移方向：
+
+[configuration.go:162-L163](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go#L162-L163)
+
+```go
+type scannerOptions struct {
+    GenreSeparators    string // Deprecated: Use Tags.genre.Split instead
+    GroupAlbumReleases bool   // Deprecated: Use PID.Album instead
+}
+```
 
 ---
 
@@ -286,9 +457,54 @@ func (r *libraryRepositoryWrapper) Save(entity any) (string, error) {
 }
 ```
 
-**Update 操作的差异化处理**：路径变更时才重启监听器和扫描：
+**Update 操作的差异化处理：路径变更 vs 路径不变**
 
 [library.go:194-L240](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/library.go#L194-L240)
+
+```go
+func (r *libraryRepositoryWrapper) Update(id string, entity any, _ ...string) error {
+    // 1. 校验 + 持久化（所有更新都执行）
+    if err := r.validateLibrary(lib); err != nil { return err }
+    originalLib, _ := r.Get(libID)
+    pathChanged := originalLib.Path != lib.Path
+    err = r.LibraryRepository.Put(lib)
+
+    // 2. 仅路径变更时执行的副作用
+    if pathChanged {
+        if r.watcher != nil {
+            if err := r.watcher.Watch(r.ctx, lib); err != nil { ... }
+        }
+        if r.scanner != nil {
+            go r.triggerScan(lib, "updated")  // 全量重扫描
+        }
+    }
+
+    // 3. 所有更新都执行的副作用
+    if r.broker != nil {
+        event := &events.RefreshResource{}
+        r.broker.SendBroadcastMessage(r.ctx, event.With("library", id))
+    }
+}
+```
+
+**路径变更 vs 路径不变的副作用对比表**：
+
+| 操作 | 路径变更时 | 路径不变时（仅改名称等） |
+|------|-----------|-----------------------|
+| 校验 `validateLibrary` | ✅ 执行 | ✅ 执行 |
+| DB `Put` 持久化 | ✅ 执行 | ✅ 执行 |
+| **重启 Watcher** | ✅ `watcher.Watch()` 重新注册文件系统监听 | ❌ 不执行 |
+| **触发全量扫描** | ✅ `triggerScan(lib, "updated")` 新协程异步执行 | ❌ 不执行 |
+| **广播刷新事件** | ✅ `RefreshResource{library: id}` | ✅ `RefreshResource{library: id}` |
+
+**Delete 操作的副作用**：
+
+[library.go:242-L284](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/library.go#L242-L284)
+
+- ✅ `watcher.StopWatching()` 停止监听
+- ✅ `triggerScan(lib, "deleted")` 清理孤立数据
+- ✅ `RefreshResource{library: id}` 广播刷新
+- ✅ `pluginManager.UnloadDisabledPlugins()` 卸载因权限丢失而自动禁用的插件
 
 ### 4.4 用户-库关联配置
 
@@ -337,33 +553,209 @@ r.Route("/plugin", func(r chi.Router) {
 })
 ```
 
-**统一更新函数 `updatePluginSettings()`**：支持配置、用户、库权限的增量更新 + 自动热重载：
+**统一更新函数 `updatePluginSettings()`**：支持配置、用户、库权限的增量更新 + 自动热重载，包含严格的卸载-重载顺序与失败回退机制：
 
 [manager.go:440-L510](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager.go#L440-L510)
 
 ```go
 func (m *Manager) updatePluginSettings(ctx, id string, updateFn func(*model.Plugin)) error {
-    // 1. 读取当前插件 → 应用更新函数 → 写回 DB
+    // 1. 读取当前插件 → 应用更新函数
     plugin, _ := repo.Get(id)
+    wasEnabled := plugin.Enabled  // 保存原状态用于回退判定
     updateFn(plugin)
     plugin.UpdatedAt = time.Now()
 
-    // 2. 权限不足时自动禁用插件
+    // 2. 权限不足时自动禁用插件（先写回DB，再卸载）
     if manifest.Permissions.Users != nil && !hasValidUsersConfig(...) {
-        _ = m.unloadPlugin(id)
-        plugin.Enabled = false
-        _ = repo.Put(plugin)
+        if wasEnabled {
+            _ = m.unloadPlugin(id)  // 先卸载
+        }
+        plugin.Enabled = false      // 标记为禁用
+        if err := repo.Put(plugin); err != nil { ... }  // 再持久化
         m.sendPluginRefreshEvent(ctx, id)
         return nil
     }
 
-    // 3. 已启用插件：卸载 → 用新配置重载
+    // 3. 已启用插件：先持久化新配置 → 卸载旧实例 → 用新配置重载
+    if err := repo.Put(plugin); err != nil { ... }  // 步骤 1：持久化新配置
+
     if wasEnabled {
-        _ = m.unloadPlugin(id)
-        _ = m.loadPluginWithConfig(plugin)  // 热重载！
+        // 步骤 2：卸载旧实例（即使失败也继续尝试加载）
+        if err := m.unloadPlugin(id); err != nil {
+            log.Debug(ctx, "Plugin was not loaded", "plugin", id)
+        }
+        // 步骤 3：用新配置重载
+        if err := m.loadPluginWithConfig(plugin); err != nil {
+            // ====== 加载失败回退机制 ======
+            plugin.LastError = err.Error()  // 记录错误信息
+            plugin.Enabled = false          // 标记为禁用
+            _ = repo.Put(plugin)            // 写回 DB 持久化回退状态
+            return fmt.Errorf("reloading plugin: %w", err)
+        }
     }
-    _ = repo.Put(plugin)
-    m.sendPluginRefreshEvent(ctx, id)  // 通知前端刷新
+
+    // 4. 成功：通知前端刷新
+    m.sendPluginRefreshEvent(ctx, id)
+    return nil
+}
+```
+
+**关键顺序保证**：**先写 DB → 再卸载 → 再加载**。这样即使加载失败，DB 中也已保存新配置，不会出现"配置写回部分成功"的不一致状态。
+
+**加载失败回退的完整链路**：
+
+| 阶段 | 操作 | 失败时 |
+|------|------|--------|
+| 1. 持久化新配置 | `repo.Put(plugin)` | 直接返回错误，不执行后续操作 |
+| 2. 卸载旧实例 | `unloadPlugin(id)` | 仅打 Debug 日志，继续加载 |
+| 3. 加载新实例 | `loadPluginWithConfig(plugin)` | 设置 `LastError` + `Enabled=false`，**再次写回 DB** 保存回退状态，返回错误 |
+
+### 4.5.1 插件目录文件监听：防抖 + SHA256 哈希自动发现
+
+当 `Plugins.AutoReload=true` 时，启动文件系统监听器自动发现插件变更：
+
+**启动与事件循环**：
+
+[manager_watcher.go:21-L81](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_watcher.go#L21-L81)
+
+```go
+func (m *Manager) startWatcher() error {
+    m.watcherEvents = make(chan notify.EventInfo, 10)
+    m.watcherDone = make(chan struct{})
+    m.debounceTimers = make(map[string]*time.Timer)
+
+    // 监听 CREATE/WRITE/REMOVE/RENAME 事件
+    _ = notify.Watch(folder, m.watcherEvents,
+        notify.Create, notify.Write, notify.Remove, notify.Rename)
+
+    go m.watcherLoop()  // 单协程事件循环
+}
+```
+
+**两级防抖机制**：
+
+[manager_watcher.go:83-L109](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_watcher.go#L83-L109)
+
+```go
+func (m *Manager) handleWatcherEvent(event notify.EventInfo) {
+    // 只处理 .ndp 插件包文件
+    if !strings.HasSuffix(path, PackageExtension) { return }
+
+    // 防抖：取消该插件已有的定时器，启动新的 2s 定时器
+    m.debounceMu.Lock()
+    if timer, exists := m.debounceTimers[pluginName]; exists {
+        timer.Stop()  // 取消上一个待处理事件
+    }
+    // 2 秒后触发实际处理（防抖窗口）
+    m.debounceTimers[pluginName] = time.AfterFunc(debounceDuration, func() {
+        m.processPluginEvent(pluginName)
+    })
+    m.debounceMu.Unlock()
+}
+```
+
+> **设计意图**：编辑器保存文件时通常会触发多次事件（写入临时文件 → 重命名 → 删除原文件），2 秒防抖窗口确保只处理最终稳定状态。
+
+**基于文件存在性的动作判定**：
+
+[manager_watcher.go:120-L133](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_watcher.go#L120-L133)
+
+```go
+func determinePluginAction(path string) pluginAction {
+    if _, err := os.Stat(path); err == nil {
+        return actionUpdate  // 文件存在 → 添加或更新
+    }
+    return actionRemove      // 文件不存在 → 删除
+}
+```
+
+> **不依赖事件类型的原因**：macOS FSEvents 会合并事件、构建工具的原子写入（写临时文件→重命名）会产生 REMOVE+CREATE 序列，基于最终文件存在性判定更可靠。
+
+**SHA256 哈希去重**：
+
+[manager_watcher.go:158-L203](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_watcher.go#L158-L203)
+
+```go
+func (m *Manager) processPluginEvent(pluginName string) {
+    sha256Hash, err := computeFileSHA256(ndpPath)
+
+    // 与 DB 中存储的哈希对比，相同则跳过
+    if dbPlugin.SHA256 == sha256Hash {
+        return  // 无实际变更
+    }
+
+    // 哈希不同 → 提取完整 manifest 并更新 DB
+    metadata, err := m.extractManifest(ndpPath)
+    if err != nil {
+        // 提取失败 → 卸载并禁用
+        if dbPlugin.Enabled {
+            _ = m.unloadPlugin(pluginName)
+            dbPlugin.Enabled = false
+        }
+        dbPlugin.LastError = err.Error()
+        _ = repo.Put(dbPlugin)
+        return
+    }
+    _ = m.updatePluginInDB(ctx, repo, dbPlugin, ndpPath, metadata)
+}
+```
+
+**SHA256 流式计算实现**：
+
+[manager_sync.go:39-L53](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_sync.go#L39-L53)
+
+```go
+func computeFileSHA256(path string) (string, error) {
+    f, err := os.Open(path)
+    defer f.Close()
+    h := sha256.New()
+    if _, err := io.Copy(h, f); err != nil {  // 流式计算，不加载整个文件到内存
+        return "", err
+    }
+    return hex.EncodeToString(h.Sum(nil)), nil
+}
+```
+
+**完整的监听-处理链路**：
+
+```
+文件事件 → handleWatcherEvent()
+    → 过滤 .ndp 文件
+    → 2s 防抖（取消旧定时器，启动新定时器）
+    → 2s 后 processPluginEvent()
+        → SHA256 哈希计算
+        → 与 DB 对比，相同则跳过
+        → 不同则提取 manifest
+            → 成功：updatePluginInDB() → 卸载+禁用+写DB
+            → 失败：unloadPlugin() + 设置 LastError + Enabled=false
+        → sendPluginRefreshEvent()
+```
+
+### 4.5.2 `unloadPlugin` 的完整清理流程
+
+[manager.go:512-L544](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager.go#L512-L544)
+
+```go
+func (m *Manager) unloadPlugin(name string) error {
+    // 1. 加锁从内存映射中移除
+    m.mu.Lock()
+    plugin, ok := m.plugins[name]
+    if !ok { m.mu.Unlock(); return error }
+    delete(m.plugins, name)
+    m.mu.Unlock()
+
+    // 2. 调用插件 Cleanup 钩子（在锁外执行，避免长时间阻塞）
+    err := plugin.Close()
+
+    // 3. 关闭 WASM 运行时实例（5s 超时，允许在途请求完成）
+    if plugin.compiled != nil {
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+        _ = plugin.compiled.Close(ctx)
+    }
+
+    runtime.GC()  // 主动 GC 释放 WASM 内存
+    return nil
 }
 ```
 
@@ -429,15 +821,15 @@ type baseEvent struct{}  // 提供默认反射实现
 | `keepAlive` | `KeepAlive` | 每 15s 心跳 |
 | `nowPlayingCount` | `NowPlayingCount` | 当前播放人数 |
 
-### 5.2 Broker 单例与消息管道
+### 5.2 Broker 单例、单协程调度与反压机制
 
 [sse.go:56-L80](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/events/sse.go#L56-L80)
 
 ```go
 type broker struct {
     publish       messageChan     // 待发布事件（buffered=2）
-    subscribing   clientsChan     // 新客户端连接
-    unsubscribing clientsChan     // 客户端断开
+    subscribing   clientsChan     // 新客户端连接（buffered=1）
+    unsubscribing clientsChan     // 客户端断开（buffered=1）
 }
 
 func GetBroker() Broker {
@@ -447,11 +839,143 @@ func GetBroker() Broker {
             subscribing:   make(clientsChan, 1),
             unsubscribing: make(clientsChan, 1),
         }
-        go broker.listen()  // 启动事件循环协程
+        go broker.listen()  // 启动**唯一的**事件循环协程
         return broker
     })
 }
 ```
+
+**单协程调度设计**：
+- 整个 Broker 只有 **一个 `listen()` 协程** 处理所有事件
+- 所有对 `clients` map 的读写都在这个协程内完成，**无需加锁**
+- 三个 channel（`publish/subscribing/unsubscribing`）作为唯一的并发访问入口
+- `select` 语句保证同一时间只处理一个事件，天然串行化
+
+### 5.2.1 反压与通道缓冲设计
+
+**三层缓冲架构**：
+
+| 层级 | 通道 | 缓冲大小 | 用途 | 阻塞行为 |
+|------|------|---------|------|---------|
+| 1. 发布端 | `broker.publish` | **2** | 事件生产者 → Broker 协程 | 满则阻塞 `SendMessage()` 调用方 |
+| 2. 客户端 | `client.msgC` | **1** | Broker 协程 → 单个客户端连接 | 满则**丢弃**事件（`sendOrDrop`） |
+| 3. 读取端 | `pl.ReadOrDone` 输出 | 0（无缓冲） | 客户端协程 → HTTP 写入 | 上下文取消即停止 |
+
+**反压策略 1：发布端阻塞**
+
+[sse.go:82-L99](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/events/sse.go#L82-L99)
+
+```go
+func (b *broker) SendMessage(ctx context.Context, evt Event) {
+    b.publish <- b.prepareMessage(ctx, evt)  // 无 select，满则阻塞！
+}
+```
+
+> **设计意图**：`publish` 通道缓冲仅为 2，当事件产生速度远超处理速度时，调用方会被阻塞，形成自然的反压。这适用于配置变更等低频但重要的事件，确保事件不丢失。
+
+**反压策略 2：客户端丢弃**
+
+[sse.go:272-L280](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/events/sse.go#L272-L280)
+
+```go
+func sendOrDrop(client client, msg message) {
+    select {
+    case client.msgC <- msg:  // 尝试写入
+    default:                  // 通道满则直接丢弃
+        if log.IsGreaterOrEqualTo(log.LevelTrace) {
+            log.Trace("Event dropped because client's channel is full", ...)
+        }
+    }
+}
+```
+
+> **设计意图**：客户端侧缓冲仅为 1，当某个客户端网络慢或处理不及时，**直接丢弃事件**而非阻塞整个 Broker。SSE 协议本身只保证最终一致，事件丢失后客户端可通过刷新恢复。
+
+**反压策略 3：优雅关闭**
+
+[pipelines.go:125-L139](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/utils/pl/pipelines.go#L125-L139)
+
+```go
+func ReadOrDone[T any](ctx context.Context, in <-chan T) <-chan T {
+    valStream := make(chan T)
+    go func() {
+        defer close(valStream)
+        for {
+            select {
+            case <-ctx.Done():     // HTTP 请求取消时立即退出
+                return
+            case v, ok := <-in:    // 从客户端 channel 读取
+                if !ok { return }  // channel 关闭则退出
+                valStream <- v     // 转发到输出 channel
+            }
+        }
+    }()
+    return valStream
+}
+```
+
+[sse.go:157-L164](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/events/sse.go#L157-L164)
+
+```go
+for event := range pl.ReadOrDone(ctx, c.msgC) {
+    err := writeEvent(ctx, w, event, writeTimeOut)
+    if err != nil {
+        return  // 写入失败（客户端断开）则终止连接
+    }
+}
+```
+
+### 5.2.2 单协程调度的完整事件循环
+
+[sse.go:213-L270](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/events/sse.go#L213-L270)
+
+```go
+func (b *broker) listen() {
+    keepAlive := time.NewTicker(keepAliveFrequency)  // 15s
+    defer keepAlive.Stop()
+
+    clients := map[client]struct{}{}  // 所有客户端状态，单协程内无需锁
+    var eventId uint64
+
+    getNextEventId := func() uint64 { eventId++; return eventId }
+
+    for {
+        select {
+        // 新客户端连接
+        case c := <-b.subscribing:
+            clients[c] = struct{}{}
+            sendOrDrop(c, serverStartEvent)
+
+        // 客户端断开
+        case c := <-b.unsubscribing:
+            close(c.msgC)
+            delete(clients, c)
+
+        // 外部事件发布
+        case msg := <-b.publish:
+            msg.id = getNextEventId()
+            for c := range clients {
+                if b.shouldSend(msg, c) {
+                    sendOrDrop(c, msg)  // 每个客户端独立判定
+                }
+            }
+
+        // 定时心跳
+        case ts := <-keepAlive.C:
+            msg := b.prepareMessage(...)
+            msg.id = getNextEventId()
+            for c := range clients {
+                sendOrDrop(c, msg)
+            }
+        }
+    }
+}
+```
+
+**单协程的并发安全保证**：
+- `clients` map 的所有读写都在同一个 goroutine 内
+- 没有互斥锁，但通过 channel 串行化所有访问
+- 事件 ID 单调递增，无需原子操作
 
 ### 5.3 发送 API：定向 vs 广播
 
@@ -653,9 +1177,120 @@ export const useRefreshOnEvents = ({ events, onRefresh }) => {
 
 ## 七、需要重启才生效的配置提示
 
-### 7.1 转码配置（Transcoding）安全提示
+### 7.1 转码配置（Transcoding）安全提示与前端渲染链路
 
 **配置项**：`EnableTranscodingConfig`
+
+#### 完整的数据流转链路
+
+**步骤 1：后端注入前端配置**
+
+[serve_index.go:45-L50](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/serve_index.go#L45-L50)
+
+```go
+appConfig := map[string]any{
+    // ...
+    "enableTranscodingConfig":   conf.Server.EnableTranscodingConfig,
+    // ...
+}
+```
+
+**步骤 2：前端配置初始化**
+
+[config.js:50-L58](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/config.js#L50-L58)
+
+```javascript
+const appConfig = JSON.parse(window.__APP_CONFIG__)
+config = { ...defaultConfig, ...appConfig }
+// config.enableTranscodingConfig 可直接访问
+```
+
+**步骤 3：列表页面根据开关控制编辑权限**
+
+[TranscodingList.jsx:7-L31](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/transcoding/TranscodingList.jsx#L7-L31)
+
+```javascript
+import config from '../config'
+
+const TranscodingList = (props) => {
+  return (
+    <List
+      {...props}
+      bulkActionButtons={config.enableTranscodingConfig}  // 批量操作开关
+    >
+      <Datagrid
+        rowClick={config.enableTranscodingConfig ? 'edit' : 'show'}  // 点击行为：编辑 or 只读查看
+      >
+        {/* ... 字段 */}
+      </Datagrid>
+    </List>
+  )
+}
+```
+
+**步骤 4：编辑页面 vs 只读页面**
+
+当 `enableTranscodingConfig=false` 时，点击行进入 **只读 Show 页面**：
+
+[TranscodingShow.jsx:10-L25](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/transcoding/TranscodingShow.jsx#L10-L25)
+
+```javascript
+const TranscodingShow = (props) => {
+  return (
+    <>
+      <TranscodingNote message={'message.transcodingDisabled'} />  // 禁用提示
+      <Show {...props}>
+        <SimpleShowLayout>{/* 只读字段 */}</SimpleShowLayout>
+      </Show>
+    </>
+  )
+}
+```
+
+当 `enableTranscodingConfig=true` 时，点击行进入 **可编辑 Edit 页面**：
+
+[TranscodingEdit.jsx:22-L37](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/transcoding/TranscodingEdit.jsx#L22-L37)
+
+```javascript
+const TranscodingEdit = (props) => {
+  return (
+    <>
+      <TranscodingNote message={'message.transcodingEnabled'} />  // 安全警告
+      <Edit {...props}>
+        <SimpleForm>{/* 可编辑表单字段 */}</SimpleForm>
+      </Edit>
+    </>
+  )
+}
+```
+
+**步骤 5：提示卡片组件 `TranscodingNote`**
+
+[TranscodingNote.jsx:15-L33](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/transcoding/TranscodingNote.jsx#L15-L33)
+
+```javascript
+export const TranscodingNote = ({ message }) => {
+  const translate = useTranslate()
+  return (
+    <Card>
+      <CardContent>
+        <Typography>
+          <Box fontWeight="fontWeightBold">
+            {translate('message.note')}:
+          </Box>{' '}
+          <Interpolate message={translate(message)} field={'config'}>
+            <Box fontFamily="Monospace">
+              ND_ENABLETRANSCODINGCONFIG=true  {/* 突出显示配置项名 */}
+            </Box>
+          </Interpolate>
+        </Typography>
+      </CardContent>
+    </Card>
+  )
+}
+```
+
+**辅助组件 `Interpolate`**：用于将 i18n 字符串中的 `%{config}` 占位符替换为高亮的 JSX 元素。
 
 **提示文案定义**（英文 i18n 资源）：
 
@@ -673,6 +1308,15 @@ export const useRefreshOnEvents = ({ events, onRefresh }) => {
 ```
 
 **生效机制**：此开关通过 `conf.Server.EnableTranscodingConfig` 控制，**修改配置文件后必须重启服务**（`EnableTranscodingConfig` 无运行时热修改 API）。
+
+**重启后效果对比**：
+
+| 状态 | `enableTranscodingConfig=false` | `enableTranscodingConfig=true` |
+|------|-------------------------------|-------------------------------|
+| 列表点击行为 | 进入只读 Show 页面 | 进入可编辑 Edit 页面 |
+| 批量操作按钮 | ❌ 隐藏 | ✅ 显示 |
+| 提示卡片 | 黄色禁用提示，引导设置 `ND_ENABLETRANSCODINGCONFIG=true` 后重启 | 红色安全警告，建议用完后关闭 |
+| 表单可编辑性 | ❌ 所有字段只读 | ✅ 可编辑 `command` 等危险字段 |
 
 ### 7.2 其他需要重启的配置项（隐含约束）
 
@@ -721,22 +1365,30 @@ export const useRefreshOnEvents = ({ events, onRefresh }) => {
 
 | 文件路径 | 核心职责 |
 |---------|---------|
-| [conf/configuration.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go) | 全局配置结构体、默认值、加载逻辑 |
-| [server/serve_index.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/serve_index.go) | 配置注入前端（`__APP_CONFIG__`） |
-| [server/events/sse.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/events/sse.go) | SSE Broker、事件循环、客户端管理 |
+| [conf/configuration.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/conf/configuration.go) | 全局配置结构体、默认值、Load 五阶段、mapDeprecatedOption |
+| [server/serve_index.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/serve_index.go) | 配置注入前端（`__APP_CONFIG__`，含 enableTranscodingConfig） |
+| [server/events/sse.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/events/sse.go) | SSE Broker、单协程事件循环、sendOrDrop 反压 |
 | [server/events/events.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/events/events.go) | 事件类型定义（RefreshResource 等） |
-| [server/nativeapi/native_api.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/nativeapi/native_api.go) | Native API 路由注册（adminOnly 配置入口） |
+| [server/nativeapi/native_api.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/nativeapi/native_api.go) | Native API 路由注册 |
 | [server/nativeapi/config.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/nativeapi/config.go) | Dev 模式配置只读接口 + 脱敏 |
 | [server/nativeapi/library.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/nativeapi/library.go) | 用户-库关联 API |
 | [server/nativeapi/plugin.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/server/nativeapi/plugin.go) | 插件配置更新 API |
-| [core/library.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/library.go) | Library 保存/更新/删除 + 事件广播 |
-| [plugins/manager.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager.go) | 插件生命周期、配置热重载 |
+| [core/library.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/library.go) | Library 保存/更新/删除 + 路径变更副作用差异 |
+| [plugins/manager.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager.go) | 插件生命周期、配置热重载、unloadPlugin 清理流程 |
+| [plugins/manager_watcher.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_watcher.go) | 插件目录监听、2s 防抖、SHA256 去重 |
+| [plugins/manager_sync.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/plugins/manager_sync.go) | 插件 DB 同步、流式 SHA256 计算 |
 | [persistence/property_repository.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/property_repository.go) | 系统属性 Upsert 实现 |
 | [persistence/user_props_repository.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/persistence/user_props_repository.go) | 用户偏好 Upsert 实现 |
 | [core/agents/session_keys.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/core/agents/session_keys.go) | UserProps 封装（Last.fm/ListenBrainz Session） |
 | [adapters/lastfm/auth_router.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/adapters/lastfm/auth_router.go) | Last.fm 授权 API |
+| [utils/pl/pipelines.go](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/utils/pl/pipelines.go) | ReadOrDone、SendOrDone 通道工具 |
+| [ui/src/config.js](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/config.js) | 前端配置初始化（从 window.__APP_CONFIG__ 读取） |
 | [ui/src/eventStream.js](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/eventStream.js) | 前端 SSE 连接 + 事件分发 |
 | [ui/src/reducers/activityReducer.js](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/reducers/activityReducer.js) | Redux 事件状态管理 |
 | [ui/src/common/useResourceRefresh.jsx](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/common/useResourceRefresh.jsx) | react-admin 资源自动刷新 Hook |
 | [ui/src/common/useRefreshOnEvents.jsx](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/common/useRefreshOnEvents.jsx) | 自定义回调刷新 Hook |
+| [ui/src/transcoding/TranscodingList.jsx](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/transcoding/TranscodingList.jsx) | 转码列表（根据开关控制编辑权限） |
+| [ui/src/transcoding/TranscodingShow.jsx](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/transcoding/TranscodingShow.jsx) | 转码只读页面（禁用状态） |
+| [ui/src/transcoding/TranscodingEdit.jsx](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/transcoding/TranscodingEdit.jsx) | 转码编辑页面（启用状态） |
+| [ui/src/transcoding/TranscodingNote.jsx](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/transcoding/TranscodingNote.jsx) | 转码提示卡片 + Interpolate 组件 |
 | [ui/src/i18n/en.json](file:///d:/fz/0601-1/solo-dogfeeding/code/93-navidrome/ui/src/i18n/en.json) | 重启提示文案定义 |
