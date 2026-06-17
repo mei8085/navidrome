@@ -657,14 +657,115 @@ func (r *radioRepository) isPermitted() bool {
 - 非管理员用户通过 Native API 调用 `POST /api/radio` → 返回 403
 - 但 `getInternetRadioStations` 对所有用户开放——**读取是全局的，写入是管理员专属**
 
-### 6.5 失败场景速查表
+### 6.5 三条播放路径的失败边界分层对比
+
+三个播放路径（浏览器音频、Web Audio/ReplayGain、第三方 Subsonic 客户端）从不同层次访问电台流，各自的失败边界截然不同。下面从网络栈、浏览器安全策略、代码处理逻辑三个维度分层对比。
+
+#### 6.5.1 层级 1：浏览器音频元素直接播放（无 ReplayGain）
+
+**失败边界**（从底层到上层）：
+
+| 检查点 | 所属层级 | 失败原因 | 诊断方法 |
+|--------|---------|---------|----------|
+| 1 | DNS/网络层 | 电台服务器不可达、DNS 解析失败 | `curl <streamUrl>` 测试 |
+| 2 | 协议层 | HTTP 流被 HTTPS 页面阻止（mixed content） | DevTools Console 查找 "Mixed Content" |
+| 3 | 响应状态层 | 4xx/5xx HTTP 错误 | DevTools Network 面板查看状态码 |
+| 4 | 响应头层 | `Content-Type` 不是浏览器支持的音频格式 | DevTools Network 查看 Response Headers |
+| 5 | 响应体层 | 音频编码格式不支持（如 AAC 编码但浏览器无解码器） | 用 ffprobe 检测流编码 |
+
+**代码事实**：
+- 此时 `crossOrigin` 未设置（默认 `null`），浏览器以 `no-cors` 模式请求
+- 响应是 opaque 的，JavaScript 无法读取错误详情
+- 失败时触发 `<audio>` 的 `error` 事件，`MediaError.message` 通常为空
+
+#### 6.5.2 层级 2：Web Audio API 处理（ReplayGain 启用）
+
+**失败边界**（在层级 1 的基础上增加）：
+
+| 检查点 | 所属层级 | 失败原因 | 诊断方法 |
+|--------|---------|---------|----------|
+| 6 | CORS 响应头层 | 无 `Access-Control-Allow-Origin` 头 | DevTools Network 查看 Response Headers |
+| 7 | CORS 凭据层 | `Access-Control-Allow-Credentials` 与请求不匹配 | 通常不影响，因为用的是 `anonymous` 模式 |
+| 8 | Web Audio 层 | `createMediaElementSource()` 调用时数据不透明 | DevTools Console 查找 `InvalidStateError` |
+
+**代码事实**：
+- 设置 `audioInstance.crossOrigin = 'anonymous'`（[Player.jsx](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/ui/src/audioplayer/Player.jsx#L152)）
+- 请求模式切换为 `cors`，但仍是 **simple request，无 preflight**。`<audio>` 的 GET 请求没有自定义头，不会发送 OPTIONS 预检请求
+- 如果层级 6 失败（无 CORS 头），在层级 1 就能播的流在层级 2 会完全不能播
+- `crossOrigin` 一经设置永久生效，代码不会在切回层级 1 时清除
+
+**关键洞察：为什么 no-cors 能播，cors 模式不能播？**
+
+浏览器的 `no-cors` 模式设计目标是**允许加载资源但禁止读取**——音频可以播放，但 JavaScript 不能访问音频数据（用于 Web Audio 处理）。`cors` 模式要求服务器明确授权，没有授权就连加载都不允许。
+
+#### 6.5.3 层级 3：第三方 Subsonic 客户端（原生 App）
+
+**失败边界**（与浏览器完全不同）：
+
+| 检查点 | 所属层级 | 失败原因 | 诊断方法 |
+|--------|---------|---------|----------|
+| 1 | DNS/网络层 | 同浏览器 | 同浏览器 |
+| 2 | 协议层 | **无 mixed content 限制**（原生 HTTP 客户端不受浏览器安全策略约束） | 同浏览器 |
+| 3 | 响应状态层 | 同浏览器 | 同浏览器 |
+| 4 | 响应头层 | **无 CORS 限制**（原生客户端不需要 CORS 头） | 同浏览器 |
+| 5 | 响应体层 | 同浏览器 | 同浏览器 |
+| 6 | 客户端解码层 | 客户端自身的音频解码能力 | 查看客户端文档 |
+| 7 | 客户端协议层 | 客户端是否支持 HLS、ICY 等直播协议 | 查看客户端文档 |
+
+**代码事实**：
+- Navidrome 返回的 `streamUrl` 是原始 URL，服务器不做任何处理（[radio.go](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/server/subsonic/radio.go#L66-L70)）
+- 原生客户端使用系统 HTTP 库（如 iOS 的 `URLSession`、Android 的 `OkHttp`），**完全不遵循浏览器的 CORS 安全模型**
+- 原生客户端可能支持更多直播协议（HLS、ICY metadata 等）
+- 原生客户端可能实现自己的转码逻辑
+
+#### 6.5.4 三个路径的失败边界对比总表
+
+| 失败模式 | 层级1：浏览器音频（no-cors） | 层级2：Web Audio（cors） | 层级3：原生客户端 |
+|---------|--------------------------|-----------------------|-----------------|
+| DNS/网络不可达 | ❌ 失败 | ❌ 失败 | ❌ 失败 |
+| Mixed Content（HTTPS→HTTP） | ❌ 失败 | ❌ 失败 | ✅ 不受影响 |
+| HTTP 4xx/5xx | ❌ 失败 | ❌ 失败 | ❌ 失败 |
+| 无 CORS 头 | ✅ 能播（opaque） | ❌ 失败 | ✅ 不受影响 |
+| CORS 头不匹配 | ✅ 能播（opaque） | ❌ 失败 | ✅ 不受影响 |
+| 编码格式不支持 | ❌ 失败 | ❌ 失败 | ❌ 失败 |
+| 直播协议不支持 | ❌ 取决于浏览器 | ❌ 取决于浏览器 | ✅ 客户端可能支持 |
+| ICY metadata 解析 | ❌ 浏览器不支持 | ❌ 浏览器不支持 | ✅ 部分客户端支持 |
+| 服务端日志可见 | ❌ 不可见 | ❌ 不可见 | ❌ 不可见 |
+
+#### 6.5.5 典型疑难场景诊断路径
+
+**场景："电台在手机 App 能播，在电脑浏览器不能播"**
+
+诊断步骤：
+1. 检查是否是 Mixed Content：Navidrome 是 HTTPS，电台 URL 是 HTTP？
+2. 检查 CORS 头：`curl -I <streamUrl>` 看是否有 `Access-Control-Allow-Origin`
+3. 检查 ReplayGain 设置：是否启用了？禁用后重试
+4. 检查 `crossOrigin` 状态：DevTools Console 输入 `document.querySelector('audio').crossOrigin`
+
+代码事实支持的结论：
+- 原生 App 不受 CORS 和 Mixed Content 限制，这是最常见的原因
+- 不是 Navidrome 的 bug，是浏览器安全模型和原生应用的本质差异
+
+**场景："电台有时能播有时不能播，和 ReplayGain 开关有关"**
+
+诊断步骤：
+1. 确认 `crossOrigin` 的残留效应：是否先播了本地歌曲启用了 ReplayGain？
+2. 检查 `audioInstance.crossOrigin` 当前值
+3. 刷新页面（重置 `crossOrigin`），不碰 ReplayGain 直接播放电台
+4. 启用 ReplayGain，观察是否立即失败
+
+代码事实支持的结论：
+- `crossOrigin` 一经设置永久生效，代码不清除
+- 即使当前播放的是电台（`isRadio=true` 跳过 ReplayGain 逻辑），`crossOrigin` 残留值仍然影响请求
+
+### 6.6 失败场景速查表
 
 | 症状 | 可能原因 | 诊断方法 | 代码位置 |
 |------|----------|----------|----------|
 | 电台无法播放，无错误提示 | 电台服务器不可达 | `curl` 测试 URL | - |
 | 电台无法播放，控制台 CORS 错误 | 电台服务器无 CORS 头 + ReplayGain 启用 | 禁用 ReplayGain 重试 | [Player.jsx](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/ui/src/audioplayer/Player.jsx#L152) |
 | 电台无法播放，mixed content 警告 | Navidrome HTTPS + 电台 HTTP 流 | 改用 HTTPS 电台 URL | - |
-| 启用 ReplayGain 后电台播放失败 | `crossOrigin='anonymous'` 触发 CORS 预检 | 确认电台 CORS 头 | [Player.jsx](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/ui/src/audioplayer/Player.jsx#L142-L162) |
+| 启用 ReplayGain 后电台播放失败 | `crossOrigin='anonymous'` 切换为 CORS 模式，电台服务器无 `Access-Control-Allow-Origin` | 确认电台 CORS 头，禁用 ReplayGain 重试 | [Player.jsx](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/ui/src/audioplayer/Player.jsx#L142-L162) |
 | 电台播放正常但无 ReplayGain | 电台 CORS 不支持 Web Audio | 检查 Network 面板 CORS 头 | [Player.jsx](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/ui/src/audioplayer/Player.jsx#L153) |
 | 播放失败后播放器停止不动 | `loadAudioErrorPlayNext: false` | 手动切换曲目 | [Player.jsx](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/ui/src/audioplayer/Player.jsx#L211) |
 | 刷新页面后电台从队列消失 | 队列不持久化电台 | 正常行为，非 bug | [playerReducer.js](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/ui/src/reducers/playerReducer.js#L43-L57) |
