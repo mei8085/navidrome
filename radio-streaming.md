@@ -78,14 +78,96 @@ Subsonic 响应结构在 [responses.go](file:///d:/fz/0601-2/solo-dogfeeding/cod
 网络电台: 播放器 → 电台服务器 StreamUrl → 播放器 (完全不经过 Navidrome)
 ```
 
-### 2.2 为什么没有代理？
+### 2.2 为什么没有代理？——从转码架构看技术原因
 
-从代码中可以推断出以下设计考量：
+外部流不经过 Navidrome 转码代理，不仅仅是设计选择，更是现有架构的客观限制。让我们从转码系统的内部结构来理解：
 
-1. **带宽成本**：电台流通常是持续的直播流，代理会消耗大量服务器带宽
-2. **转码复杂性**：直播流转码需要特殊处理（HLS/ICY 等协议），与本地文件转码架构不同
-3. **Subsonic 标准**：Subsonic API 规范中 Internet Radio 的 streamUrl 就是供客户端直接播放的
-4. **功能边界**：Navidrome 定位是个人音乐服务器，而非电台代理服务器
+#### 2.2.1 转码管道的输入假设
+
+整个转码系统的入口是 `MediaStreamer.NewStream()`，定义在 [media_streamer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/core/stream/media_streamer.go#L26-L27)：
+
+```go
+type MediaStreamer interface {
+    NewStream(ctx context.Context, mf *model.MediaFile, req Request) (*Stream, error)
+}
+```
+
+**输入参数是 `*model.MediaFile`**，而不是 `*model.Radio`。这意味着：
+- 转码系统从设计上就只认识本地媒体文件
+- Radio 实体根本无法进入转码管道
+- 没有任何代码路径能把电台的 `StreamUrl` 喂给 ffmpeg
+
+#### 2.2.2 ffmpeg 的输入约束
+
+深入到 [ffmpeg.go](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/core/ffmpeg/ffmpeg.go#L75-L89) 的 `Transcode()` 方法：
+
+```go
+func (e *ffmpeg) Transcode(ctx context.Context, opts TranscodeOptions) (io.ReadCloser, error) {
+    if _, err := ffmpegCmd(); err != nil {
+        return nil, err
+    }
+    if err := fileExists(opts.FilePath); err != nil {  // 关键点：检查本地文件是否存在
+        return nil, err
+    }
+    // ...
+    args = append(args, "-i", opts.FilePath)       // -i 后面是本地文件路径
+    // ...
+}
+```
+
+`TranscodeOptions` 中的 `FilePath` 字段（定义在 [ffmpeg.go](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/core/ffmpeg/ffmpeg.go#L25-L34)）是整个转码过程的输入源，它被假定为**本地文件系统路径**：
+- `fileExists(opts.FilePath)` 调用 `os.Stat()` 检查本地文件
+- `-i` 参数直接传递给 ffmpeg 作为输入文件
+- 完全没有 URL 输入的处理逻辑
+
+ffmpeg 本身确实支持 HTTP 输入（`ffmpeg -i http://...`），但 Navidrome 的封装层没有暴露这个能力，也没有相关的错误处理、超时控制、重定向处理等机制。
+
+#### 2.2.3 转码决策依赖的元数据
+
+转码决策器 `TranscodeDecider`（定义在 [decider.go](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/core/stream/decider.go#L21-L26)）的 `MakeDecision()` 方法需要 `*model.MediaFile` 来获取：
+
+| 元数据 | 来源 | 电台是否可用 |
+|--------|------|-------------|
+| 容器格式（Suffix） | 文件扩展名 | ❌ 只有 URL |
+| 编码格式（AudioCodec） | 标签/ffprobe | ❌ 不可用 |
+| 比特率（BitRate） | 标签/ffprobe | ❌ 不可用 |
+| 采样率（SampleRate） | 标签/ffprobe | ❌ 不可用 |
+| 声道数（Channels） | 标签/ffprobe | ❌ 不可用 |
+| 时长（Duration） | 标签/ffprobe | ❌ 直播流无固定时长 |
+| 文件大小（Size） | 文件系统 | ❌ 不可用 |
+| ProbeData | ffprobe 结果缓存 | ❌ 不可用 |
+
+电台流在播放前无法可靠获取这些元数据（除非先连接并探测），而转码决策需要在播放开始前完成。
+
+#### 2.2.4 缓存与 seek 架构不匹配
+
+本地文件转码缓存的 Key（定义在 [media_streamer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/core/stream/media_streamer.go#L59-L61)）是：
+
+```go
+func (j *streamJob) Key() string {
+    return fmt.Sprintf("%s.%s.%d.%d.%d.%d.%s.%d", 
+        j.mf.ID, j.mf.UpdatedAt.Format(time.RFC3339Nano), 
+        j.bitRate, j.sampleRate, j.bitDepth, j.channels, 
+        j.format, j.offset)
+}
+```
+
+这个缓存机制的前提是**内容固定**：同样的 ID + 同样的参数 → 同样的输出。但电台直播流是实时的：
+- 内容随时间变化，缓存没有意义
+- `UpdatedAt` 对直播流没有意义
+- `offset`（秒级跳转）对直播流不可用
+
+Seek 功能同样不成立：本地文件可以通过 `-ss` 参数跳到指定位置（[media_streamer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/20-navidrome/core/stream/media_streamer.go#L158-L162) 用 `http.ServeContent` 支持 Range 请求），但直播流是顺序的，无法回退。
+
+#### 2.2.5 设计层面的综合考量
+
+除了上述架构限制，还有明确的设计选择：
+
+1. **带宽成本**：电台流是持续的直播流，代理会消耗大量服务器带宽和流量
+2. **协议复杂性**：网络电台使用多种协议（HTTP progressive、HLS、ICY/SHOUTcast），每种都需要专门处理
+3. **Subsonic 标准对齐**：Subsonic API 规范中 Internet Radio 的 streamUrl 就是供客户端直接播放的，服务器不参与
+4. **功能边界**：Navidrome 定位是个人音乐服务器，而非电台代理/重流服务器
+5. **故障责任**：直连模式下，电台不可用是电台的问题；代理模式下，用户会归咎于 Navidrome
 
 ### 2.3 经过服务器的唯一数据：封面图
 
