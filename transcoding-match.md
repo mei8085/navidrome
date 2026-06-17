@@ -174,10 +174,15 @@ type Transcoding struct {
 1. **ffprobe 探测数据**（如果可用）：最权威的音频参数
 2. **标签元数据**：从音乐文件标签中解析的信息
 
-**ffprobe 探测**（可选，由 `DevEnableMediaFileProbe` 控制）：
+**ffprobe 探测**（可选，由 `DevEnableMediaFileProbe` 控制，默认 false）：
 - 首次请求时运行 ffprobe 获取精确的编码信息
 - 结果序列化为 JSON 存入 `media_file.probe_data` 字段
 - 后续请求直接使用缓存的数据
+
+**探测数据使用的关键细节**：
+- `MakeDecision` 的 `TranscodeOptions.SkipProbe` 参数控制是否**主动触发**探测
+- 但即使 `SkipProbe=true`，在 `buildSourceStream` 中仍会尝试解析 `mf.ProbeData`（如果数据库中已有）
+- 因此：传统接口不主动触发探测，但会使用已有的探测数据
 
 ### 4.3 直接播放检查
 
