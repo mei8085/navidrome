@@ -428,7 +428,7 @@ clientInfo.TranscodingProfiles = slices.DeleteFunc(clientInfo.TranscodingProfile
 
 **问题**：当客户端没有指定比特率时，如何确保转码有一个合理的默认比特率？
 
-**答案**：有**三层配置 fallback + 一层运行时保护**确保目标比特率始终有有效值。
+**答案**：`lookupDefaultBitrate` **仅在一条非常特定的路径上被调用**，大部分路径有各自的码率确定规则。`ts.Bitrate` 在无损→无损路径下就是 0，并非"始终有有效值"。完整机制如下。
 
 **完整码率确定链路**（从入口到兜底）：
 
@@ -837,4 +837,7 @@ GetTranscodeStream handler
 9. **渐进式降级**：格式不支持时尝试回退到默认下采样格式，最终回退到原始格式
 10. **探测数据两用**：SkipProbe 只控制主动探测，已有探测数据仍会被使用
 11. **临时兼容处理**：OpenSubsonic 接口会从 TranscodingProfiles 中过滤 AAC 候选（不影响 DirectPlayProfiles），待稳定性修复后移除
-12. **多层 fallback 保障**：默认比特率有三级配置 fallback（数据库→内置→256kbps 硬编码）+ 运行时零值保护（用源码率作基准）+ ffmpeg 编码器自身默认值
+12. **默认码率触发条件严格**：只有无损源→有损目标且未设置任何码率上限时，才会调用 lookupDefaultBitrate
+13. **零值比较基准**：`applyLimitation` 中 `sourceBitrate` 只作比较基准，不会修改 ts.Bitrate，只有需要向下调整时才真正赋值
+14. **单位换算统一入口**：OpenSubsonic 的 bps 在 `toCoreClientInfo` 中统一转换为 kbps（四舍五入）
+15. **全局码率硬限制**：`MaxAudioBitrate` 超过时直接跳过所有直接播放检查，进入转码流程
