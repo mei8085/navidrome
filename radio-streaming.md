@@ -486,9 +486,9 @@ case PLAYER_REFRESH_QUEUE: {
 - `MediaError.message` 通常为空或只显示笼统的错误描述
 - **浏览器安全策略禁止暴露跨域错误的详细信息**
 
-这是最难诊断的场景：错误消息被浏览器主动隐藏了。打开浏览器开发者工具的 Network 面板，看到的可能是：
-- 请求根本没有发出去（preflight 失败）
-- 或者请求发出但 response 被标记为 "blocked by CORS policy"
+这是最难诊断的场景：错误消息被浏览器主动隐藏了。打开浏览器开发者工具的 Network 面板，看到的是：
+- 请求发出但 response 被标记为 "blocked by CORS policy"
+- **注意：`crossOrigin` 设置本身不触发 preflight（预检）**。对于 `<audio>` 元素的简单 GET 请求，没有自定义头，属于 simple request，不会发送 OPTIONS 预检请求。失败的原因是服务器不返回 `Access-Control-Allow-Origin` 头，浏览器在 CORS 模式下拒绝加载响应。
 
 **形态 2：Web Audio API 级别失败（CORS 阻止音频处理）**
 
