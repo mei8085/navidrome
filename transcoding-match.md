@@ -233,19 +233,40 @@ type Transcoding struct {
 
 `computeBitrate` 方法在 [decider.go](core/stream/decider.go#L370-L396)：
 
-根据源文件是否无损，采用不同策略：
+根据源文件是否无损，采用完全不同的策略：
 
-**源文件是无损格式：**
-- 目标也是无损 → 保留源比特率（不转换）
-- 目标是有损 → 优先级：
-  1. `MaxTranscodingAudioBitrate`（转码专用上限）
-  2. `MaxAudioBitrate`（全局上限）
-  3. 格式默认比特率（`lookupDefaultBitrate`）
+**源文件是无损格式（`src.IsLossless == true`）：**
 
-**源文件是有损格式：**
-- 直接使用源文件比特率（不升码）
+分支 A：**目标是有损**（`targetIsLossless == false`）—— 唯一会走默认值的路径：
+```go
+if clientInfo.MaxTranscodingAudioBitrate > 0 {
+    ts.Bitrate = clientInfo.MaxTranscodingAudioBitrate
+} else if clientInfo.MaxAudioBitrate > 0 {
+    ts.Bitrate = clientInfo.MaxAudioBitrate
+} else {
+    ts.Bitrate = lookupDefaultBitrate(ctx, s.ds, targetFormat)  // ← 仅此处调用默认值
+}
+```
+优先级：
+1. `MaxTranscodingAudioBitrate`（转码专用上限）
+2. `MaxAudioBitrate`（全局上限）
+3. 格式默认比特率（`lookupDefaultBitrate`）—— **仅当前两个都为 0 时才走到**
 
-**最终限制**：使用 `MaxAudioBitrate` 作为最终上限
+分支 B：**目标是无损**（`targetIsLossless == true`）：
+- 不设置 `ts.Bitrate`（保持默认 0）
+- 但会检查：如果 `MaxAudioBitrate > 0` 且 `src.Bitrate > MaxAudioBitrate` → 直接拒绝此 Profile
+
+**源文件是有损格式（`src.IsLossless == false`）：**
+- 直接使用源文件比特率：`ts.Bitrate = src.Bitrate`
+- **永远不会调用 lookupDefaultBitrate**
+
+**最终限制**（所有分支都经过）：
+```go
+if clientInfo.MaxAudioBitrate > 0 && ts.Bitrate > 0 && ts.Bitrate > clientInfo.MaxAudioBitrate {
+    ts.Bitrate = clientInfo.MaxAudioBitrate
+}
+```
+用 `MaxAudioBitrate` 作为上限截断，**注意 `ts.Bitrate > 0` 的条件：无损→无损时 `ts.Bitrate==0`，不会被截断**。
 
 ### 4.6 编解码器限制应用
 
