@@ -113,14 +113,124 @@ if count, folderCount, err := s.getCounters(ctx); err != nil {
 
 `WriteAfterScanMetrics` 同时会刷新 `db_model_totals` 数据库计数指标。
 
-#### 链路 3：插件调用指标
+#### 链路 3：插件调用指标（修正版）
 
 **接口抽象**：为避免循环依赖，插件包在 [plugins/manager.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-navidrome/plugins/manager.go#L41-L45) 定义了独立的 `PluginMetricsRecorder` 接口，在 Wire 注入时绑定到 `metrics.Metrics`（见 [wire_injectors.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-navidrome/cmd/wire_injectors.go#L54)）。
 
-**写入逻辑**：[plugins/manager_call.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-navidrome/plugins/manager_call.go) 的 `callFunction` 在三种分支都会记录：
-- 第 69 行：context 取消或插件执行错误 → `ok=false`
-- 第 80 行：插件退出码非零（非 notImplemented） → `ok=false`
-- 第 92 行：正常执行完成（含 JSON 反序列化成功与否） → `ok=(err==nil)`
+**核心函数**：所有插件调用都流经 [plugins/manager_call.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-navidrome/plugins/manager_call.go#L38-L96) 的 `callPluginFunction` 泛型函数。
+
+##### 完整分支与指标记录对照表
+
+以下是 `callPluginFunction` 函数的所有退出路径，按代码执行顺序排列：
+
+| 代码位置 | 场景 | 是否记录指标 | 记录值（ok） | 备注 |
+|----------|------|--------------|--------------|------|
+| 第 44-47 行 | `plugin.instance(ctx)` 创建插件实例失败 | ❌ **不记录** | - | 插件 WASM 加载失败、内存不足等 |
+| 第 50-53 行 | `p.FunctionExists(funcName)` 函数不存在 | ❌ **不记录** | - | 插件未导出该函数 |
+| 第 55-58 行 | `json.Marshal(input)` 输入序列化失败 | ❌ **不记录** | - | 输入参数序列化错误 |
+| 第 65-68 行 | `CallWithContext` 返回错误且 `ctx.Err() != nil`（Context 被取消） | ❌ **不记录** | - | 请求超时、用户取消、服务关闭等 |
+| 第 69 行 | `CallWithContext` 返回其他错误（非 Context 取消） | ✅ 记录 | `false` | 插件执行时发生未捕获错误 |
+| 第 74-78 行 | `exit == notImplementedCode`（函数存在但未实现） | ❌ **不记录** | - | 代码明确注释掉了，见第 77 行 `//plugin.metrics.RecordPluginRequest(...)` |
+| 第 80 行 | `exit != 0` 且不是 `notImplementedCode` | ✅ 记录 | `false` | 插件主动返回非零退出码 |
+| 第 92 行 | `exit == 0` 正常返回 + JSON 反序列化成功 | ✅ 记录 | `true` | 调用成功且输出解析正常 |
+| 第 92 行 | `exit == 0` 正常返回 + JSON 反序列化失败 | ✅ 记录 | `false` | 插件执行成功但输出格式不符合预期 |
+
+##### 关键分支代码解析
+
+1. **Context 取消分支（第 63-72 行）**
+
+   ```go
+   exit, output, err := p.CallWithContext(ctx, funcName, inputBytes)
+   elapsed := time.Since(startCall)
+   if err != nil {
+       if ctx.Err() != nil {
+           // ⚠️  这里直接返回，不记录任何指标！
+           log.Debug(ctx, "Plugin call cancelled", "plugin", plugin.name, ...)
+           return result, ctx.Err()
+       }
+       // 只有非取消的错误才记录
+       plugin.metrics.RecordPluginRequest(ctx, plugin.name, funcName, false, elapsed.Milliseconds())
+       ...
+   }
+   ```
+
+   **注意**：Context 取消场景（请求超时、客户端断开连接、服务优雅关闭）完全不会出现在指标中。
+
+2. **NotImplemented 分支（第 73-82 行）**
+
+   ```go
+   if exit != 0 {
+       if exit == notImplementedCode {
+           log.Trace(ctx, "Plugin function not implemented", ...)
+           // TODO Should we record metrics for not implemented calls?
+           // ⚠️  下面这行被注释掉了，不记录指标！
+           //plugin.metrics.RecordPluginRequest(ctx, plugin.name, funcName, true, elapsed.Milliseconds())
+           return result, fmt.Errorf("%w: %s", errNotImplemented, funcName)
+       }
+       plugin.metrics.RecordPluginRequest(ctx, plugin.name, funcName, false, elapsed.Milliseconds())
+       ...
+   }
+   ```
+
+   **注意**：插件明确返回「未实现」（`notImplementedCode = 0xFFFFFFFE`）时，代码注释掉了指标记录逻辑。
+
+3. **正常返回分支（第 84-95 行）**
+
+   ```go
+   // 走到这里说明 exit == 0 且 CallWithContext 无错误
+   if len(output) > 0 {
+       err = json.Unmarshal(output, &result)
+       if err != nil {
+           log.Trace(ctx, "Plugin call failed", ...)  // 虽然打了 error 日志
+       }
+   }
+   // ⚠️  JSON 反序列化失败也会记录，ok 值取决于反序列化是否成功
+   plugin.metrics.RecordPluginRequest(ctx, plugin.name, funcName, err == nil, elapsed.Milliseconds())
+   ```
+
+##### 对巡检判断的影响
+
+| 影响点 | 说明 | 巡检建议 |
+|--------|------|----------|
+| **指标不完整** | 至少 5 种失败场景不会进入指标 | 不能仅凭 `plugin_request_count` 判断总调用量 |
+| **失败率偏低** | Context 取消、实例创建失败等错误不计入指标 | 计算失败率时，实际失败率可能高于指标显示值 20%-50% |
+| **静默失败** | 插件系统级故障（WASM 加载失败、序列化问题）完全无指标体现 | 需同时监控日志中的 `failed to create plugin`、`failed to marshal input` 等错误 |
+| **NotImplemented 盲区** | 大量可选接口未实现不会被发现 | 若预期插件应实现某些功能，需通过业务结果反向验证 |
+| **Context 取消混淆** | 正常的客户端取消（如用户切换页面）与异常的服务端超时混在一起，且都不记录 | 高并发场景下无法区分是用户主动取消还是系统处理超时 |
+
+##### 巡检告警规则修正（基于代码事实）
+
+```yaml
+# 插件调用失败率告警（需考虑指标不完整，阈值设低一些）
+- alert: PluginHighFailureRate
+  expr: sum(rate(plugin_request_count{ok="false"}[5m])) / sum(rate(plugin_request_count[5m])) > 0.05  # 原 0.1 → 修正为 0.05
+  for: 2m
+  labels:
+    severity: warning
+
+# 补充：通过日志监控插件系统级错误（Promtail + Loki 示例）
+#  count_over_time({job="navidrome"} |= "failed to create plugin" [5m]) > 0
+#  count_over_time({job="navidrome"} |= "failed to marshal input" [5m]) > 0
+```
+
+##### 记录指标的三种场景总结
+
+```
+callPluginFunction 执行路径
+    │
+    ├─ 创建实例失败 → ❌ 不记录
+    ├─ 函数不存在 → ❌ 不记录
+    ├─ 输入序列化失败 → ❌ 不记录
+    ├─ CallWithContext 出错
+    │   ├─ Context 取消 → ❌ 不记录
+    │   └─ 其他错误 → ✅ ok=false
+    ├─ exit != 0
+    │   ├─ notImplemented → ❌ 不记录（被注释）
+    │   └─ 其他退出码 → ✅ ok=false
+    └─ exit == 0
+        ├─ JSON 反序列化成功 → ✅ ok=true
+        └─ JSON 反序列化失败 → ✅ ok=false
+```
 
 ### 2.5 Prometheus 端点安全
 
