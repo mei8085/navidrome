@@ -15,7 +15,7 @@ Navidrome 的"设置"实际分为 **两个完全不同的层次**，它们的热
 
 ### 2.1 配置加载入口
 
-[configuration.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/conf/configuration.go#L293-L294) 定义全局单例：
+`conf/configuration.go` 定义全局单例：
 
 ```go
 var Server = &configOptions{}
@@ -26,7 +26,7 @@ var Server = &configOptions{}
 1. `conf.InitConfig()` — 初始化 Viper，绑定环境变量前缀 `ND_`
 2. `conf.Load()` — 读取配置文件 → 反序列化到 `conf.Server` → 运行校验 → 执行注册的 Hook
 
-关键代码位于 [configuration.go#L323-L475](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/conf/configuration.go#L323-L475)：
+关键代码位于 `conf/configuration.go` 的 `Load()` 函数：
 
 ```go
 func Load(noConfigDump bool) {
@@ -43,7 +43,7 @@ func Load(noConfigDump bool) {
 
 ### 2.2 管理端配置查看接口
 
-[native_api.go#L234-L238](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/server/nativeapi/native_api.go#L234-L238) 注册了只读的配置端点：
+`server/nativeapi/native_api.go` 的 `addConfigRoute()` 注册了只读的配置端点：
 
 ```go
 func (api *Router) addConfigRoute(r chi.Router) {
@@ -53,7 +53,7 @@ func (api *Router) addConfigRoute(r chi.Router) {
 }
 ```
 
-[config.go#L96-L129](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/server/nativeapi/config.go#L96-L129) 中 `getConfig` 仅做 GET 读取，序列化 `conf.Server` 并对敏感字段脱敏后返回。**没有 PUT/POST handler，不支持运行时修改**。
+`server/nativeapi/config.go` 中 `getConfig` 仅做 GET 读取，序列化 `conf.Server` 并对敏感字段脱敏后返回。**没有 PUT/POST handler，不支持运行时修改**。
 
 ### 2.3 配置在运行时的消费方式
 
@@ -61,8 +61,8 @@ func (api *Router) addConfigRoute(r chi.Router) {
 
 - 配置 API 是只读的
 - 没有对配置文件的 `fsnotify` 监听
-- `SIGHUP` 信号在 [root.go#L108](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/cmd/root.go#L108) 中被注册，但仅用于触发 context 取消（关闭进程），不会重载配置
-- `SIGUSR1` 信号（[signaller_unix.go#L15-L40](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/cmd/signaller_unix.go#L15-L40)）只触发音乐库扫描，不涉及配置
+- `SIGHUP` 信号在 `cmd/root.go` 中被注册，但仅用于触发 context 取消（关闭进程），不会重载配置
+- `SIGUSR1` 信号（`cmd/signaller_unix.go`）只触发音乐库扫描，不涉及配置
 
 ### 2.4 部分配置在启动时缓存
 
@@ -70,15 +70,15 @@ func (api *Router) addConfigRoute(r chi.Router) {
 
 | 子系统 | 缓存的配置项 | 代码位置 |
 |--------|-------------|---------|
-| 定时扫描调度 | `Scanner.Schedule` | [root.go#L144-L167](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/cmd/root.go#L144-L167) |
-| 定时备份调度 | `Backup.Schedule` | [root.go#L243-L276](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/cmd/root.go#L243-L276) |
-| 文件监控防抖间隔 | `Scanner.WatcherWait` | [watcher.go#L50](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/scanner/watcher.go#L50) |
-| Scanner 控制器 | `DevExternalScanner` | [controller.go#L37](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/scanner/controller.go#L37) |
-| 插件文件监控 | `Plugins.AutoReload` | [manager.go#L164](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/plugins/manager.go#L164) |
+| 定时扫描调度 | `Scanner.Schedule` | `cmd/root.go` |
+| 定时备份调度 | `Backup.Schedule` | `cmd/root.go` |
+| 文件监控防抖间隔 | `Scanner.WatcherWait` | `scanner/watcher.go` |
+| Scanner 控制器 | `DevExternalScanner` | `scanner/controller.go` |
+| 插件文件监控 | `Plugins.AutoReload` | `plugins/manager.go` |
 
 ### 2.5 `conf.AddHook` 机制
 
-[configuration.go#L716-L718](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/conf/configuration.go#L716-L718) 提供了钩子注册：
+`conf/configuration.go` 提供了钩子注册：
 
 ```go
 func AddHook(hook func()) {
@@ -100,13 +100,378 @@ Hook 仅在 `conf.Load()` 末尾执行一次，用于初始化派生配置：
 
 ---
 
-## 三、运行时数据变更 — 支持热加载
+## 三、前端发起配置变更到接口调用的完整链路
 
-以下设置可通过管理端 API 运行时修改，变更后 **立即对在线客户端生效**。
+Navidrome 前端基于 **react-admin** 框架构建，通过标准化的 dataProvider 抽象层与后端 API 通信。
 
-### 3.1 变更广播基础设施：SSE Broker
+### 3.1 前端架构概览
 
-[events.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/server/events/events.go) 和 [sse.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/server/events/sse.go) 实现了基于 Server-Sent Events 的实时推送：
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        UI 组件层 (JSX)                            │
+│  LibraryEdit / LibraryCreate / PluginShow / UserEdit / ...        │
+│  - 使用 useMutation / useUpdate / useDeleteWithConfirmController  │
+│  - 自定义 save() callback                                         │
+└────────────────────────────────┬─────────────────────────────────┘
+                                 │
+                                 ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                  react-admin DataProvider 抽象层                   │
+│  wrapperDataProvider (ui/src/dataProvider/wrapperDataProvider.js) │
+│  - 包装 ra-data-json-server                                       │
+│  - 特殊资源路由映射 (playlistTrack, user 库关联)                   │
+│  - 注入 library 过滤参数                                          │
+└────────────────────────────────┬─────────────────────────────────┘
+                                 │
+                                 ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                     HTTP 客户端层                                  │
+│  httpClient (ui/src/dataProvider/httpClient.js)                   │
+│  - 添加 X-ND-Authorization (Bearer JWT) 头                        │
+│  - 添加 X-ND-Client-Unique-Id (客户端 UUID)                       │
+│  - 拦截响应头刷新 token                                            │
+│  - base URL: /api (定义于 ui/src/consts.js → REST_URL)            │
+└────────────────────────────────┬─────────────────────────────────┘
+                                 │
+                                 ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                  后端 Go Chi Router                               │
+│  server/nativeapi/native_api.go: Router.routes()                  │
+│  - 权限中间件 adminOnlyMiddleware (adminOnly=true 的资源)          │
+│  - 映射 REST 动词到 Repository 包装层方法                          │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 音乐库（Library）变更完整链路
+
+#### 3.2.1 编辑音乐库（PUT /api/library/{id}）
+
+**前端入口**：`ui/src/library/LibraryEdit.jsx`
+
+```
+用户点击"Save"按钮
+  │
+  ▼
+LibraryEdit.save()  [LibraryEdit.jsx#L60-L82]
+  │
+  ├─ useMutation() 提交
+  │   type: 'update'
+  │   resource: 'library'
+  │   payload: { id, data: { name, path, defaultNewUsers } }
+  │
+  ▼
+wrapperDataProvider.update('library', params)
+  └─ mapResource() → 无特殊映射，直接透传
+  │
+  ▼
+ra-data-json-server → JSON REST API 适配
+  └─ 生成 PUT /api/library/{id}
+     Body: { "name": "...", "path": "...", "defaultNewUsers": true }
+  │
+  ▼
+httpClient(url, { method: 'PUT', body, headers })
+  ├─ 注入 X-ND-Authorization: Bearer <token>
+  ├─ 注入 X-ND-Client-Unique-Id: <uuid>
+  └─ Accept: application/json
+  │
+  ▼
+Go 后端 Chi Router
+  │
+  ├─ 中间件链：
+  │   ├─ JWTMiddleware → 解析 JWT，设置 ctx 用户身份
+  │   ├─ adminOnlyMiddleware → 校验 role == "admin"
+  │   └─ URLParamParserMiddleware → 解析 /{id} 参数
+  │
+  ▼
+Router.routes() 中注册的 PUT handler
+  └─ libraryRepositoryWrapper.Update(ctx, id, entity)
+     [core/library.go#L194-L240]
+     │
+     ├─ 1) 持久化：LibraryRepository.Put(lib) 写入 SQLite
+     │
+     ├─ 2) 路径变更检测：
+     │   ├─ if lib.Path != oldPath:
+     │   │   ├─ watcher.Watch(ctx, lib)  ← 重启该库的文件监控
+     │   │   │   (关闭旧的 watcher，新建 fsnotify watcher)
+     │   │   └─ scanner.ScanAll(ctx)    ← 异步触发全库扫描
+     │   └─ else: 跳过
+     │
+     ├─ 3) 事件广播：
+     │   └─ broker.SendBroadcastMessage(ctx,
+     │        &RefreshResource{}.With("library", string(id)))
+     │      ↓
+     │      server/events/sse.go Broker
+     │      - 遍历所有已连接 SSE 客户端
+     │      - shouldSend() 过滤
+     │      - sendOrDrop() 写入每个客户端的 channel
+     │
+     └─ 4) 返回序列化后的 library JSON
+  │
+  ▼
+httpClient 处理响应
+  ├─ 检查响应头 X-ND-Authorization，若有则更新 localStorage token
+  └─ 返回 Promise resolve
+  │
+  ▼
+LibraryEdit.save() 收到成功响应
+  ├─ notify('resources.library.notifications.updated')
+  └─ redirect('/library')  ← 跳转到库列表页
+  │
+  ▼
+SSE 事件到达所有在线客户端
+  │
+  ▼
+eventStream.js EventSource 监听 refreshResource 事件
+  ├─ dispatch(processEvent('refreshResource', data))
+  │   ↓
+  │   reducers/activityReducer.js
+  │   - 更新 state.activity.refresh:
+  │     { lastReceived: Date.now(), resources: {"library":["id"]} }
+  │
+  ▼
+订阅了该事件的组件触发重新渲染
+  │
+  ├─ LibraryList.jsx 使用 useResourceRefresh('library')
+  │   [common/useResourceRefresh.jsx]
+  │   - 读取 state.activity.refresh
+  │   - 检测到 library 资源变更
+  │   - 调用 dataProvider.getMany('library', {ids: ["id"]})
+  │   - react-admin 缓存更新 → UI 自动重渲染
+  │
+  └─ LibrarySelector.jsx 使用 useRefreshOnEvents({events:['library',...]})
+      - 检测到 library 事件
+      - 触发自定义 onRefresh() 重新加载用户可用库列表
+```
+
+#### 3.2.2 新建音乐库（POST /api/library）
+
+**前端入口**：`ui/src/library/LibraryCreate.jsx#L25-L71`
+
+与编辑类似，`useMutation()` type 为 `'create'`，后端走 `libraryRepositoryWrapper.Create()`，
+成功后同样触发 `watcher.Watch()` + `scanner.ScanAll()` + SSE 广播。
+
+#### 3.2.3 删除音乐库（DELETE /api/library/{id}）
+
+**前端入口**：`ui/src/library/DeleteLibraryButton.jsx`
+
+使用 react-admin 的 `useDeleteWithConfirmController`，弹出确认对话框后发起 DELETE 请求。
+后端删除后额外调用 `pluginManager.UnloadDisabledPlugins()` 清理因权限丢失而被自动禁用的插件。
+
+#### 3.2.4 触发扫描（GET /rest/startScan）
+
+**前端入口**：`ui/src/library/LibraryScanButton.jsx#L23-L49`
+
+扫描按钮不通过 dataProvider，而是直接调用 `subsonic/index.js` 的 `startScan()`：
+
+```
+LibraryScanButton.handleClick()
+  │
+  ├─ subsonic.startScan({ fullScan, target: ["1:", "2:"] })
+  │   ↓
+  │   subsonic/url() 构建 Subsonic 风格 URL:
+  │   /rest/startScan?u=<user>&t=<token>&s=<salt>&f=json&v=1.8.0&c=NavidromeUI
+  │   &target=1:&target=2:  (每个 libraryID: 表示扫描整个库)
+  │
+  ▼
+httpClient 发送 GET 请求
+  │
+  ▼
+后端 Subsonic API handler startScan()
+  ├─ scanner.Rescan(ctx, mediaFolderIds, fullScan)
+  └─ 扫描完成后在 scanner/controller.go 中广播全局 RefreshResource
+```
+
+### 3.3 插件（Plugin）变更完整链路
+
+插件管理使用 react-admin 的 **Show** 视图（而非 Edit 视图），因为一个插件有多个独立的可修改区域（配置、用户权限、库权限、启用状态），需要分开发送更新请求。
+
+#### 3.3.1 插件主容器
+
+**前端入口**：`ui/src/plugin/PluginShow.jsx`
+
+`PluginShowLayout` 组件通过 `useShowController` 获取插件数据后，将其拆分为多个独立的 state：
+
+```
+PluginShow.jsx 初始化
+  │
+  ├─ state.configData       ← 来自 record.config JSON 字符串
+  ├─ state.selectedUsers + state.allUsers   ← 来自 record.users + record.allUsers
+  ├─ state.selectedLibraries + state.allLibraries + state.allowWriteAccess
+  │                         ← 来自 record.libraries + record.allLibraries + ...
+  └─ state.isDirty          ← 是否有未保存变更
+  │
+  ├─ useUpdate() hook 预配置：
+  │   resource: 'plugin', id: record.id, undoable: false
+  │   onSuccess: refresh() + setIsDirty(false) + notify()
+  │
+  └─ handleSaveConfig()  [PluginShow.jsx#L200-L234]
+      │
+      ├─ 按 manifest 权限门控组装 payload：
+      │   {
+      │     config: JSON.stringify(configData),      // 仅当有 config.schema
+      │     users: JSON.stringify(selectedUsers),    // 仅当有 permissions.users
+      │     allUsers: allUsers,
+      │     libraries: JSON.stringify(selectedLibraries), // 仅当有 permissions.library
+      │     allLibraries: allLibraries,
+      │     allowWriteAccess: allowWriteAccess,
+      │   }
+      │
+      └─ updatePlugin('plugin', record.id, data, record)
+          ↓
+          dataProvider.update('plugin', { id, data })
+          ↓
+          PUT /api/plugin/{id}
+```
+
+#### 3.3.2 启用/禁用插件开关
+
+**前端入口**：`ui/src/plugin/ToggleEnabledSwitch.jsx#L57-L81`
+
+这是一个独立的 `useUpdate()` 调用，在列表页和详情页都可用：
+
+```
+ToggleEnabledSwitch.handleClick()
+  │
+  ├─ useUpdate('plugin', id, { enabled: !record.enabled }, record)
+  │   ↓
+  │   PUT /api/plugin/{id}
+  │   Body: { "enabled": false }
+  │
+  ├─ onSuccess: refresh() + notify()
+  └─ onFailure: refresh() + notify(error)
+```
+
+#### 3.3.3 后端插件更新处理
+
+`server/nativeapi/plugin.go` 的 `updatePlugin()` 根据请求 body 的字段分发到不同逻辑：
+
+```
+PUT /api/plugin/{id}
+  │
+  ▼
+PluginUpdateRequest 绑定 JSON body
+  │
+  ▼
+updatePlugin(ctx, id, req)  [plugin.go#L68-L167]
+  │
+  ├─ 如果 req.Config 字段存在：
+  │   ValidatePluginConfig(id, req.Config)  ← AJV schema 校验
+  │   UpdatePluginConfig(id, req.Config)
+  │     │
+  │     ▼ manager.go updatePluginSettings()
+  │       ├─ repo.Get(id) → 从 DB 读 plugin
+  │       ├─ plugin.Config = req.Config  ← 修改内存对象
+  │       ├─ repo.Put(plugin)  ← 写回 DB
+  │       ├─ unloadPlugin(id)
+  │       │   ├─ delete(Manager.plugins, id)  ← 从内存 map 移除
+  │       │   ├─ plugin.Close()               ← 调用插件清理函数
+  │       │   └─ compiledPlugin.Close(ctx)    ← 释放 wazero 编译缓存
+  │       └─ loadPluginWithConfig(plugin)
+  │           ├─ manager.loadPlugin()  ← 读取 .ndp 包
+  │           ├─ wazero.CompileModule()  ← 重新编译 WASM
+  │           ├─ instantiateModule()    ← 实例化 WASM
+  │           ├─ 初始化沙箱环境 (fs, host functions)
+  │           └─ Manager.plugins[id] = loaded
+  │
+  ├─ 如果 req.Users / req.AllUsers 字段存在：
+  │   UpdatePluginUsers(id, req.Users, req.AllUsers)
+  │     ↓ 同样走 updatePluginSettings() + unload+reload
+  │     + 权限门控校验：若 users 为空且 !allUsers → DisablePlugin()
+  │
+  ├─ 如果 req.Libraries / req.AllLibraries / req.AllowWriteAccess 存在：
+  │   UpdatePluginLibraries(...)
+  │     ↓ 同上，附带写权限门控校验
+  │
+  └─ 如果 req.Enabled 字段存在：
+      ├─ true  → EnablePlugin(id)
+      │           loadPluginWithConfig() + repo.Put + sendPluginRefreshEvent()
+      └─ false → DisablePlugin(id)
+                  unloadPlugin() + repo.Put + sendPluginRefreshEvent()
+  │
+  ▼
+sendPluginRefreshEvent() → SendBroadcastMessage(RefreshResource{plugin: [id]})
+  │
+  ▼
+所有在线客户端 SSE 收到 {"plugin":["id"]}
+  │
+  ▼
+PluginShow.jsx 通过 useResourceRefresh('plugin')  [PluginShow.jsx#L34]
+  → dataProvider.getMany('plugin', {ids: [id]})
+  → react-admin 重新获取数据 → useShowController 更新 record
+  → useEffect 检测到 record 变化 → 重新初始化本地 state
+```
+
+### 3.4 用户（User）变更完整链路
+
+#### 3.4.1 用户编辑
+
+**前端入口**：`ui/src/user/UserEdit.jsx#L83-L105`
+
+用户编辑有一个特殊的"库选择"字段 `LibrarySelectionField`，通过 wrapperDataProvider 的 `updateUser()` 处理两阶段提交：
+
+```
+UserEdit.save()
+  │
+  ├─ useMutation()
+  │   type: 'update'
+  │   resource: 'user'
+  │   payload: { id, data: { userName, name, email, isAdmin, libraryIds, ... } }
+  │
+  ▼
+wrapperDataProvider.update('user', params)  [wrapperDataProvider.js#L178-L184]
+  │
+  ▼
+updateUser(params)  [wrapperDataProvider.js#L128-L146]
+  │
+  ├─ 阶段 1：先更新用户基本信息
+  │   dataProvider.update('user', { ...params, data: userData })
+  │   ↓
+  │   PUT /api/user/{id}
+  │   Body: { "userName": "...", "name": "...", "isAdmin": false, ... }
+  │   (不含 libraryIds 字段)
+  │
+  └─ 阶段 2：如果非 admin 用户且指定了 libraryIds：
+      handleUserLibraryAssociation(userId, libraryIds)
+        ↓
+        PUT /api/user/{id}/library
+        Body: { "libraryIds": ["1", "3"] }
+```
+
+#### 3.4.2 用户删除
+
+**前端入口**：`ui/src/user/DeleteUserButton.jsx`（react-admin 标准删除按钮）
+
+后端 `core/user.go` 的 `userRepositoryWrapper.Delete()` 删除用户后：
+- 级联清理插件用户权限引用表
+- 调用 `pluginManager.UnloadDisabledPlugins()` 卸载因用户删除导致权限不满足的插件
+- 广播 SSE `RefreshResource{user: [id]}`
+
+### 3.5 Subsonic API 调用链路
+
+扫描触发、播放报告等功能走 **Subsonic API**（`/rest/*`）而非 Native API（`/api/*`），URL 格式不同但使用同一个 `httpClient`：
+
+```
+subsonic/url() 构建
+  │
+  ├─ 读取 localStorage:
+  │   username, subsonic-token, subsonic-salt
+  │
+  ├─ 标准 Subsonic 参数：
+  │   u=username, t=token, s=salt
+  │   f=json, v=1.8.0, c=NavidromeUI
+  │
+  └─ 附加业务参数 (id, options 展开)
+
+示例：/rest/startScan?u=admin&t=abc&s=xyz&f=json&v=1.8.0&c=NavidromeUI&target=1:
+```
+
+---
+
+## 四、运行时数据变更广播与前端消费
+
+### 4.1 变更广播基础设施：SSE Broker
+
+`server/events/events.go` 和 `server/events/sse.go` 实现了基于 Server-Sent Events 的实时推送：
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -124,7 +489,7 @@ Hook 仅在 `conf.Load()` 末尾执行一次，用于初始化派生配置：
 └──────────────────────────────────────────────┘
 ```
 
-SSE 端点挂载在 [server.go#L188-L195](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/server/server.go#L188-L195)：
+SSE 端点挂载在 `server/server.go`：
 
 ```go
 if conf.Server.DevActivityPanel {
@@ -132,7 +497,7 @@ if conf.Server.DevActivityPanel {
 }
 ```
 
-前端通过 [eventStream.js](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/ui/src/eventStream.js) 订阅事件：
+前端通过 `ui/src/eventStream.js` 订阅事件：
 
 ```js
 stream.addEventListener('refreshResource', eventHandler(dispatchFn))
@@ -140,7 +505,7 @@ stream.addEventListener('scanStatus', throttledEventHandler(dispatchFn))
 stream.addEventListener('nowPlayingCount', eventHandler(dispatchFn))
 ```
 
-### 3.2 核心事件类型
+### 4.2 核心事件类型
 
 | 事件类型 | 触发场景 | 数据格式 |
 |---------|---------|---------|
@@ -150,151 +515,73 @@ stream.addEventListener('nowPlayingCount', eventHandler(dispatchFn))
 | `ServerStart` | 新客户端连接时推送 | `{"startTime":"...","version":"..."}` |
 | `KeepAlive` | 每 15 秒心跳 | `{"ts":1700000000}` |
 
-### 3.3 各类设置的热加载路径
+### 4.3 前端消费 SSE 事件的两种 Hook
+
+#### useResourceRefresh（react-admin 资源刷新）
+
+`ui/src/common/useResourceRefresh.jsx`：适用于 react-admin 管理的资源（library、plugin、album 等）。
+
+工作流程：
+1. 从 Redux store 读取 `state.activity.refresh`
+2. 比较 `lastReceived` 时间戳判断是否有新事件
+3. 按资源类型匹配：
+   - `{"*":"*"}` → 调用 `refresh()` 全局刷新
+   - `{"library":["1","2"]}` → 调用 `dataProvider.getMany('library', {ids:["1","2"]})`
+4. react-admin 缓存更新后，订阅该资源的组件自动重渲染
+
+使用示例：
+```jsx
+// PluginShow.jsx
+useResourceRefresh('plugin')  // 插件数据变化时自动 getMany 刷新
+
+// LibraryList.jsx
+useResourceRefresh('library') // 库列表变化时自动刷新
+```
+
+#### useRefreshOnEvents（自定义回调刷新）
+
+`ui/src/common/useRefreshOnEvents.jsx`：适用于需要自定义刷新逻辑的场景（非 react-admin 直接管理的数据）。
+
+工作流程：
+1. 同样监听 `state.activity.refresh`
+2. 按 `events` 数组匹配资源类型
+3. 匹配成功后调用用户传入的 `onRefresh()` 异步回调
+
+使用示例：
+```jsx
+// LibrarySelector 中重新加载用户可用库列表
+useRefreshOnEvents({
+    events: ['library', 'user'],
+    onRefresh: loadUserLibraries  // 自定义异步函数
+})
+```
+
+### 4.4 Redux 事件分发
+
+SSE 事件到达前端后，通过 Redux reducer 更新全局状态：
+
+`ui/src/reducers/activityReducer.js`：
+
+```js
+case EVENT_REFRESH_RESOURCE:
+    return {
+        ...previousState,
+        refresh: {
+            lastReceived: Date.now(),  // Hook 用时间戳判断新事件
+            resources: data,           // {"library": ["1"], "plugin": ["x"]}
+        },
+    }
+```
+
+两个 Hook 都通过 `useSelector(state => state.activity.refresh)` 订阅这个状态，当 `lastReceived` 变化时触发刷新逻辑。
 
 ---
 
-#### 3.3.1 音乐库（Library）设置
+## 五、配置注入 UI 的方式
 
-**变更入口**：`PUT /api/library/{id}`
+### 5.1 页面加载时注入
 
-**完整路径**：
-
-```
-API 请求
-  │
-  ▼
-native_api.go: Router.routes() → adminOnlyMiddleware
-  │
-  ▼
-library.go: libraryRepositoryWrapper.Update()
-  │
-  ├─ LibraryRepository.Put(lib)        ← 持久化到 DB
-  │
-  ├─ 检查 path 是否变化
-  │   ├─ 是 → watcher.Watch(ctx, lib)  ← 重启文件监控
-  │   │      scanner.ScanAll()          ← 异步触发扫描
-  │   └─ 否 → 跳过
-  │
-  └─ broker.SendBroadcastMessage(
-       &RefreshResource{}.With("library", id)
-     )                                  ← 广播 SSE 事件
-  │
-  ▼
-前端 eventStream.js 收到 refreshResource 事件
-  → Redux dispatch(processEvent)
-  → re-fetch 数据
-```
-
-关键代码：[library.go#L194-L240](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/core/library.go#L194-L240)
-
-新建和删除库的流程类似，删除时额外调用 `pluginManager.UnloadDisabledPlugins()` 清理因权限丢失而被自动禁用的插件。
-
----
-
-#### 3.3.2 插件（Plugin）设置
-
-**变更入口**：`PUT /api/plugin/{id}`
-
-**完整路径**：
-
-```
-API 请求 (PluginUpdateRequest)
-  │
-  ▼
-plugin.go: updatePlugin()
-  │
-  ├─ Config 变更?
-  │   └─ ValidatePluginConfig() → UpdatePluginConfig()
-  │       │
-  │       ▼ manager.go: updatePluginSettings()
-  │         ├─ repo.Get(id)
-  │         ├─ updateFn(plugin)           ← 修改内存中的 plugin 对象
-  │         ├─ repo.Put(plugin)           ← 持久化到 DB
-  │         ├─ unloadPlugin(id)           ← 卸载 WASM 插件实例
-  │         └─ loadPluginWithConfig(plugin) ← 用新配置重新加载
-  │
-  ├─ Users/Libraries 变更?
-  │   └─ UpdatePluginUsers() / UpdatePluginLibraries()
-  │       └─ 同样走 updatePluginSettings()
-  │       └─ 检查权限门控，不满足则自动 DisablePlugin()
-  │
-  ├─ Enabled 变更?
-  │   ├─ EnablePlugin()
-  │   │   ├─ loadPluginWithConfig()      ← 加载 WASM 到内存
-  │   │   ├─ repo.Put(plugin)            ← 标记 enabled
-  │   │   └─ sendPluginRefreshEvent()    ← 广播 SSE
-  │   └─ DisablePlugin()
-  │       ├─ unloadPlugin()              ← 从内存卸载 WASM
-  │       ├─ repo.Put(plugin)            ← 标记 disabled
-  │       └─ sendPluginRefreshEvent()    ← 广播 SSE
-  │
-  └─ 返回更新后的 plugin JSON
-```
-
-关键代码：
-- [plugin.go#L68-L167](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/server/nativeapi/plugin.go#L68-L167)
-- [manager.go#L440-L510](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/plugins/manager.go#L440-L510)
-
-**插件热加载的真正核心**：`unloadPlugin()` + `loadPluginWithConfig()` 组合操作：
-1. 从 `Manager.plugins` map 中移除
-2. 调用 `plugin.Close()` 执行插件定义的清理函数
-3. 关闭 `wazero.CompiledPlugin` 释放 WASM 编译缓存
-4. 用新配置重新编译和实例化 WASM 插件
-
-**文件级自动重载**：当 `Plugins.AutoReload = true` 时，[manager_watcher.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/plugins/manager_watcher.go) 监控 `.ndp` 插件包文件变化：
-- 2 秒防抖（`debounceDuration`）
-- 检测文件存在性而非事件类型（处理 Rename/临时文件等边界情况）
-- SHA256 比对判断是否真正变更
-
----
-
-#### 3.3.3 用户（User）设置
-
-**变更入口**：`PUT /api/user/{id}`, `DELETE /api/user/{id}`
-
-用户删除的完整路径：
-
-```
-DELETE /api/user/{id}
-  │
-  ▼
-user.go: userRepositoryWrapper.Delete()
-  │
-  ├─ UserRepository.Delete(id)           ← DB 级联清理
-  │   └─ cleanupPluginUserReferences()   ← 清理插件用户权限引用
-  │
-  └─ pluginManager.UnloadDisabledPlugins()
-      │                                  ← 检查因用户删除导致权限不满足的插件
-      ├─ 查询 DB 中所有 enabled=false 的插件
-      ├─ 对仍在内存中的执行 unloadPlugin()
-      └─ sendPluginRefreshEvent()        ← 广播 SSE
-```
-
-关键代码：[user.go#L63-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/core/user.go#L63-L75)
-
----
-
-#### 3.3.4 扫描（Scan）触发
-
-扫描完成后，若检测到变更，通过 SSE 广播 `RefreshResource` 通知所有客户端刷新：
-
-```go
-// scanner/controller.go#L233-L236
-if s.changesDetected {
-    s.broker.SendBroadcastMessage(ctx, &events.RefreshResource{})
-}
-```
-
-这里的 `RefreshResource` 不携带具体资源 ID（等效于 `{"*":"*"}`），意味着前端会刷新所有数据。
-
----
-
-## 四、配置注入 UI 的方式
-
-### 4.1 页面加载时注入
-
-[serve_index.go#L42-L83](file:///d:/fz/0601-2/solo-dogfeeding/code/39-navidrome/server/serve_index.go#L42-L83) 在渲染 `index.html` 时将 `conf.Server` 的部分字段序列化为 JSON 注入到页面：
+`server/serve_index.go` 在渲染 `index.html` 时将 `conf.Server` 的部分字段序列化为 JSON 注入到页面：
 
 ```go
 appConfig := map[string]any{
@@ -307,21 +594,40 @@ appConfig := map[string]any{
 
 这些值在页面刷新前不会变化。用户需要 **刷新浏览器** 才能看到服务器级配置变更的效果。
 
-### 4.2 SSE 事件驱动更新
+### 5.2 SSE 事件驱动更新
 
 运行时数据（Library、Plugin 等）的变更通过 SSE 实时推送到前端，不需要刷新页面。
 
 ---
 
-## 五、总结：热加载能力矩阵
+## 六、总结：热加载能力矩阵
 
-| 设置类别 | 修改方式 | 持久化 | 内存生效 | 前端生效 | 触发副作用 |
-|---------|---------|--------|---------|---------|-----------|
-| 服务器配置 `conf.Server` | 改配置文件/环境变量 + 重启 | ✅ 文件 | ❌ 需重启 | ❌ 需刷新 | — |
-| 音乐库 Library | REST API | ✅ DB | ✅ 立即 | ✅ SSE | 重启监控 + 触发扫描 |
-| 插件 Plugin | REST API | ✅ DB | ✅ 重载WASM | ✅ SSE | unload+load 插件 |
-| 插件文件 `.ndp` | 文件系统变更 | ✅ DB | ✅ 重载WASM | ✅ SSE | AutoReload 时自动 |
-| 用户 User | REST API | ✅ DB | ✅ 立即 | 需要时 | 清理插件权限 |
-| 扫描触发 | REST API / 信号 | ✅ DB | ✅ 立即 | ✅ SSE | 全局 RefreshResource |
+| 设置类别 | 前端入口组件 | 请求方法与路径 | 持久化 | 内存生效 | 前端生效 | 触发副作用 |
+|---------|------------|--------------|--------|---------|---------|-----------|
+| 服务器配置 `conf.Server` | (无，只读) | GET /api/config/ | ✅ 文件 | ❌ 需重启 | ❌ 需刷新 | — |
+| 编辑音乐库 | LibraryEdit.jsx | PUT /api/library/{id} | ✅ DB | ✅ 立即 | ✅ SSE | 重启监控 + 触发扫描 |
+| 新建音乐库 | LibraryCreate.jsx | POST /api/library | ✅ DB | ✅ 立即 | ✅ SSE | 启动监控 + 触发扫描 |
+| 删除音乐库 | DeleteLibraryButton.jsx | DELETE /api/library/{id} | ✅ DB | ✅ 立即 | ✅ SSE | 清理插件权限 |
+| 插件配置/权限 | PluginShow.jsx Save 按钮 | PUT /api/plugin/{id} | ✅ DB | ✅ 重载WASM | ✅ SSE | unload+load 插件 |
+| 插件启用切换 | ToggleEnabledSwitch.jsx | PUT /api/plugin/{id} | ✅ DB | ✅ 重载WASM | ✅ SSE | unload+load 插件 |
+| 插件文件 `.ndp` | (文件系统变更) | (无 API) | ✅ DB | ✅ 重载WASM | ✅ SSE | AutoReload 时自动 |
+| 编辑用户 | UserEdit.jsx | PUT /api/user/{id} + PUT /api/user/{id}/library | ✅ DB | ✅ 立即 | 需要时 | 级联插件权限 |
+| 删除用户 | DeleteUserButton.jsx | DELETE /api/user/{id} | ✅ DB | ✅ 立即 | 需要时 | 清理插件权限 |
+| 触发扫描 | LibraryScanButton.jsx | GET /rest/startScan | ✅ DB | ✅ 立即 | ✅ SSE | 全局 RefreshResource |
 
-**核心结论**：Navidrome 的"管理端设置变更热加载"主要体现在 **数据库驱动的运行时数据**（Library、Plugin、User 等），通过 SSE 广播 + 直接操作内存对象实现实时生效。而 **服务器级配置**（`conf.Server`）不支持运行时热加载，变更后必须重启进程。
+**核心结论**：Navidrome 的"管理端设置变更热加载"主要体现在 **数据库驱动的运行时数据**（Library、Plugin、User 等），完整链路为：
+
+```
+UI 组件交互 (useMutation/useUpdate)
+  → react-admin wrapperDataProvider
+    → httpClient (注入 JWT + Client-Id)
+      → Go Chi Router (JWT + admin 权限中间件)
+        → Repository Wrapper (DB 持久化 + 副作用)
+          → SSE Broker SendBroadcastMessage
+            → 所有在线前端 EventSource
+              → Redux activityReducer
+                → useResourceRefresh / useRefreshOnEvents
+                  → 局部 dataProvider.getMany() 或全局 refresh()
+```
+
+而 **服务器级配置**（`conf.Server`）不支持运行时热加载，变更后必须重启进程。
