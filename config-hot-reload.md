@@ -405,64 +405,159 @@ PluginShow.jsx 通过 useResourceRefresh('plugin')  [PluginShow.jsx#L34]
 
 当 `Plugins.AutoReload = true` 时，`plugins/manager_watcher.go` 监控 `.ndp` 文件变化。这是文件系统级别的变更，不经过 REST API。
 
-**完整处理流程**（`manager_watcher.go` L135-L217 `processPluginEvent`）：
+> ⚠️ **重要纠正**：文件变更后插件**不会自动重新加载**。根据 `manager_sync.go` 中的实现，文件变更是"卸载 + 禁用"策略（安全默认），需要管理员手动重新启用。
+
+**三类路径的完整处理流程**：
+
+##### 路径一：文件新增（新插件出现）
+
+调用 `addPluginToDB()`（`manager_sync.go` L56-L73）：
 
 ```
-文件系统事件 (CREATE/WRITE/REMOVE/RENAME)
+新 .ndp 文件出现在 plugins 目录
   │
   ▼
-handleWatcherEvent(event)  [L84-L109]
+processPluginEvent → actionUpdate
   │
-  ├─ 过滤非 .ndp 文件
-  ├─ 2 秒防抖（取消旧 timer，新建 timer）
-  └─ 防抖到期后调用 processPluginEvent(pluginName)
+  ├─ repo.Get(name) → 不存在（新插件）
+  ├─ extractManifest(ndpPath) → 提取成功
   │
   ▼
-processPluginEvent(pluginName)  [L135-L217]
+addPluginToDB(ctx, repo, name, path, metadata)
   │
-  ├─ 根据文件存在性判断 action：
-  │   ├─ os.Stat(path) 成功 → actionUpdate（文件存在）
-  │   └─ os.Stat(path) 失败 → actionRemove（文件已删除）
+  ├─ 构造 model.Plugin：
+  │   {
+  │     ID: name,
+  │     Enabled: false,       ← 默认为禁用
+  │     Manifest: marshal(metadata.Manifest),
+  │     SHA256: metadata.SHA256,
+  │     Path: path,
+  │     CreatedAt: now, UpdatedAt: now,
+  │   }
   │
-  ├─ actionUpdate（文件存在/变更）：
-  │   │
-  │   ├─ 1) SHA256 比对  [L161-L184]
-  │   │   ├─ 计算新文件 SHA256
-  │   │   ├─ 与 DB 中 dbPlugin.SHA256 比较
-  │   │   └─ 相同 → return（无实际变更，跳过）
-  │   │
-  │   ├─ 2) 提取 manifest  [L186-L199]
-  │   │   │
-  │   │   ├─ 提取失败：
-  │   │   │   ├─ 设置 dbPlugin.LastError = err.Error()
-  │   │   │   ├─ dbPlugin.UpdatedAt = time.Now()
-  │   │   │   ├─ **如果 dbPlugin.Enabled == true**：
-  │   │   │   │   ├─ m.unloadPlugin(pluginName)  ← 卸载内存中的插件
-  │   │   │   │   ├─ dbPlugin.Enabled = false      ← 标记为禁用
-  │   │   │   │   └─ repo.Put(dbPlugin)
-  │   │   │   └─ **注意：此路径不调用 sendPluginRefreshEvent！**
-  │   │   │      前端不会收到 SSE 刷新通知（潜在 bug）
-  │   │   │
-  │   │   └─ 提取成功：
-  │   │       └─ 调用 m.updatePluginInDB()  [L201]
-  │   │           ├─ 更新 DB 中的 manifest、SHA256、版本等信息
-  │   │           ├─ 如果插件已启用 → unloadPlugin() + loadPluginWithConfig()
-  │   │           └─ 调用 sendPluginRefreshEvent() 广播 SSE 事件
-  │   │
-  │   └─ 小结：
-  │      ✅ 提取成功 → 重载 + 广播
-  │      ❌ 提取失败 + 已启用 → 禁用 + 不广播（前端需手动刷新）
+  ├─ repo.Put(newPlugin)  ← 写入 DB
   │
-  └─ actionRemove（文件被删除）：
-      │
-      ├─ repo.Get(pluginName) → 从 DB 获取插件
-      └─ 调用 m.removePluginFromDB()
-          ├─ 如果插件已启用 → unloadPlugin()
-          ├─ 从 DB 删除插件记录
-          └─ 调用 sendPluginRefreshEvent() 广播 SSE 事件
+  └─ m.sendPluginRefreshEvent(ctx, events.Any)
+       ↓
+       广播 {"plugin":["*"]}  ← 用通配符刷新所有插件列表
 ```
 
-`sendPluginRefreshEvent` 的实现（`manager.go` L86-L92）：
+**行为**：新增 → 禁用 → 广播全部插件刷新
+
+---
+
+##### 路径二：文件变更且 manifest 提取成功
+
+调用 `updatePluginInDB()`（`manager_sync.go` L77-L96）：
+
+```
+已有的 .ndp 文件内容变化
+  │
+  ▼
+processPluginEvent → actionUpdate
+  │
+  ├─ SHA256 比对 → 变化
+  ├─ extractManifest(ndpPath) → 提取成功
+  │
+  ▼
+updatePluginInDB(ctx, repo, dbPlugin, path, metadata)
+  │
+  ├─ wasEnabled := dbPlugin.Enabled
+  │
+  ├─ if wasEnabled:
+  │    m.unloadPlugin(dbPlugin.ID)  ← 从内存卸载
+  │      ├─ delete(m.plugins, id)
+  │      ├─ plugin.Close()         ← 调用插件清理函数
+  │      └─ compiledPlugin.Close() ← 释放 wazero 编译缓存
+  │
+  ├─ 更新 DB 字段：
+  │   dbPlugin.Path = path
+  │   dbPlugin.Manifest = marshal(metadata.Manifest)
+  │   dbPlugin.SHA256 = metadata.SHA256
+  │   dbPlugin.Enabled = false      ← ⚠️ 强制禁用！不是重载
+  │   dbPlugin.LastError = ""
+  │   dbPlugin.UpdatedAt = now
+  │
+  ├─ repo.Put(dbPlugin)  ← 写回 DB
+  │
+  └─ m.sendPluginRefreshEvent(ctx, dbPlugin.ID)
+       ↓
+       广播 {"plugin":["id"]}  ← 仅刷新该插件
+```
+
+**关键代码**（`manager_sync.go` L87）：
+```go
+dbPlugin.Enabled = false  // 强制禁用，即使之前是启用的
+```
+
+**行为**：变更 + 提取成功 → **卸载 + 强制禁用** → 广播单插件刷新
+
+> 🔍 **设计意图**：这是"安全默认"策略。插件文件变更可能引入不兼容的 manifest 变化或破坏性更新，自动重新启用可能导致意外行为。因此先禁用，让管理员确认后手动启用。
+
+---
+
+##### 路径三：文件变更且 manifest 提取失败
+
+**不调用独立函数，在 `processPluginEvent` 内联处理**（`manager_watcher.go` L186-L198）：
+
+```
+已有的 .ndp 文件内容变化
+  │
+  ▼
+processPluginEvent → actionUpdate
+  │
+  ├─ SHA256 比对 → 变化
+  ├─ extractManifest(ndpPath) → 提取失败
+  │
+  ├─ dbPlugin.LastError = err.Error()
+  ├─ dbPlugin.UpdatedAt = time.Now()
+  │
+  ├─ if dbPlugin.Enabled:
+  │   ├─ m.unloadPlugin(pluginName)  ← 卸载内存中的插件
+  │   └─ dbPlugin.Enabled = false     ← 标记为禁用
+  │
+  ├─ repo.Put(dbPlugin)  ← 写回 DB
+  │
+  └─ ❌ **不调用 sendPluginRefreshEvent()！**
+       前端不会收到 SSE 刷新通知（潜在 bug）
+```
+
+**行为**：变更 + 提取失败 → 卸载 + 禁用 + 记录错误 → **不广播**
+
+> 🐛 **潜在问题**：插件实际已被禁用，但前端 UI 不会自动刷新，管理员可能以为插件仍在运行。需要手动刷新页面才能看到状态变化。
+
+---
+
+##### 路径四：文件被删除
+
+调用 `removePluginFromDB()`（`manager_sync.go` L100-L113）：
+
+```
+.ndp 文件被删除
+  │
+  ▼
+processPluginEvent → actionRemove
+  │
+  ├─ repo.Get(pluginName) → 从 DB 获取
+  │
+  ▼
+removePluginFromDB(ctx, repo, dbPlugin)
+  │
+  ├─ if dbPlugin.Enabled:
+  │    m.unloadPlugin(pluginID)  ← 从内存卸载
+  │
+  ├─ repo.Delete(pluginID)  ← 从 DB 删除
+  │
+  └─ m.sendPluginRefreshEvent(ctx, events.Any)
+       ↓
+       广播 {"plugin":["*"]}  ← 用通配符刷新所有插件列表
+```
+
+**行为**：删除 → 卸载（如果启用）→ DB 删除 → 广播全部插件刷新
+
+---
+
+**sendPluginRefreshEvent 实现**（`manager.go` L86-L92）：
 
 ```go
 func (m *Manager) sendPluginRefreshEvent(ctx context.Context, pluginIDs ...string) {
@@ -474,17 +569,22 @@ func (m *Manager) sendPluginRefreshEvent(ctx context.Context, pluginIDs ...strin
 }
 ```
 
-**插件文件变更行为总结**：
+`events.Any` 是字符串常量 `"*"`，作为通配符 ID 传入。
 
-| 场景 | 内存操作 | 广播 SSE |
-|------|---------|---------|
-| SHA256 未变 | 跳过 | ❌ |
-| SHA256 变化 + manifest 提取成功 + 已启用 | unload + reload | ✅ `{"plugin":["id"]}` |
-| SHA256 变化 + manifest 提取成功 + 未启用 | 仅更新 DB | ✅ `{"plugin":["id"]}` |
-| SHA256 变化 + manifest 提取失败 + 已启用 | unload + Enabled=false | ❌（潜在 bug） |
-| SHA256 变化 + manifest 提取失败 + 未启用 | 仅更新 DB + LastError | ❌（潜在 bug） |
-| .ndp 文件被删除 + 已启用 | unload + DB 删除 | ✅ `{"plugin":["id"]}` |
-| .ndp 文件被删除 + 未启用 | 仅 DB 删除 | ✅ `{"plugin":["id"]}` |
+---
+
+**插件文件变更行为总表（按代码事实）**：
+
+| 场景 | 调用函数 | 卸载内存 | DB 操作 | Enabled 状态 | 广播 SSE |
+|------|---------|---------|---------|-------------|---------|
+| 新文件出现 | `addPluginToDB()` | ❌ 不需要 | Put（新增） | `false`（默认禁用） | ✅ `{"plugin":["*"]}` |
+| 文件变更 + 提取成功 + 已启用 | `updatePluginInDB()` | ✅ unload | Put（更新） | `false`（强制禁用） | ✅ `{"plugin":["id"]}` |
+| 文件变更 + 提取成功 + 未启用 | `updatePluginInDB()` | ❌ 未加载 | Put（更新） | `false`（保持禁用） | ✅ `{"plugin":["id"]}` |
+| 文件变更 + 提取失败 + 已启用 | 内联处理 | ✅ unload | Put（更新） | `false`（禁用 + LastError） | ❌ 不广播 |
+| 文件变更 + 提取失败 + 未启用 | 内联处理 | ❌ 未加载 | Put（更新） | `false`（保持禁用 + LastError） | ❌ 不广播 |
+| 文件被删除 + 已启用 | `removePluginFromDB()` | ✅ unload | Delete | （记录删除） | ✅ `{"plugin":["*"]}` |
+| 文件被删除 + 未启用 | `removePluginFromDB()` | ❌ 未加载 | Delete | （记录删除） | ✅ `{"plugin":["*"]}` |
+| SHA256 未变 | 跳过 | — | — | — | ❌ |
 
 ### 3.4 用户（User）变更完整链路
 
