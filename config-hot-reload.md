@@ -401,13 +401,100 @@ PluginShow.jsx 通过 useResourceRefresh('plugin')  [PluginShow.jsx#L34]
   → useEffect 检测到 record 变化 → 重新初始化本地 state
 ```
 
+#### 3.3.4 插件文件自动重载（.ndp 文件变更）
+
+当 `Plugins.AutoReload = true` 时，`plugins/manager_watcher.go` 监控 `.ndp` 文件变化。这是文件系统级别的变更，不经过 REST API。
+
+**完整处理流程**（`manager_watcher.go` L135-L217 `processPluginEvent`）：
+
+```
+文件系统事件 (CREATE/WRITE/REMOVE/RENAME)
+  │
+  ▼
+handleWatcherEvent(event)  [L84-L109]
+  │
+  ├─ 过滤非 .ndp 文件
+  ├─ 2 秒防抖（取消旧 timer，新建 timer）
+  └─ 防抖到期后调用 processPluginEvent(pluginName)
+  │
+  ▼
+processPluginEvent(pluginName)  [L135-L217]
+  │
+  ├─ 根据文件存在性判断 action：
+  │   ├─ os.Stat(path) 成功 → actionUpdate（文件存在）
+  │   └─ os.Stat(path) 失败 → actionRemove（文件已删除）
+  │
+  ├─ actionUpdate（文件存在/变更）：
+  │   │
+  │   ├─ 1) SHA256 比对  [L161-L184]
+  │   │   ├─ 计算新文件 SHA256
+  │   │   ├─ 与 DB 中 dbPlugin.SHA256 比较
+  │   │   └─ 相同 → return（无实际变更，跳过）
+  │   │
+  │   ├─ 2) 提取 manifest  [L186-L199]
+  │   │   │
+  │   │   ├─ 提取失败：
+  │   │   │   ├─ 设置 dbPlugin.LastError = err.Error()
+  │   │   │   ├─ dbPlugin.UpdatedAt = time.Now()
+  │   │   │   ├─ **如果 dbPlugin.Enabled == true**：
+  │   │   │   │   ├─ m.unloadPlugin(pluginName)  ← 卸载内存中的插件
+  │   │   │   │   ├─ dbPlugin.Enabled = false      ← 标记为禁用
+  │   │   │   │   └─ repo.Put(dbPlugin)
+  │   │   │   └─ **注意：此路径不调用 sendPluginRefreshEvent！**
+  │   │   │      前端不会收到 SSE 刷新通知（潜在 bug）
+  │   │   │
+  │   │   └─ 提取成功：
+  │   │       └─ 调用 m.updatePluginInDB()  [L201]
+  │   │           ├─ 更新 DB 中的 manifest、SHA256、版本等信息
+  │   │           ├─ 如果插件已启用 → unloadPlugin() + loadPluginWithConfig()
+  │   │           └─ 调用 sendPluginRefreshEvent() 广播 SSE 事件
+  │   │
+  │   └─ 小结：
+  │      ✅ 提取成功 → 重载 + 广播
+  │      ❌ 提取失败 + 已启用 → 禁用 + 不广播（前端需手动刷新）
+  │
+  └─ actionRemove（文件被删除）：
+      │
+      ├─ repo.Get(pluginName) → 从 DB 获取插件
+      └─ 调用 m.removePluginFromDB()
+          ├─ 如果插件已启用 → unloadPlugin()
+          ├─ 从 DB 删除插件记录
+          └─ 调用 sendPluginRefreshEvent() 广播 SSE 事件
+```
+
+`sendPluginRefreshEvent` 的实现（`manager.go` L86-L92）：
+
+```go
+func (m *Manager) sendPluginRefreshEvent(ctx context.Context, pluginIDs ...string) {
+    if m.broker == nil {
+        return
+    }
+    event := (&events.RefreshResource{}).With("plugin", pluginIDs...)
+    m.broker.SendBroadcastMessage(ctx, event)
+}
+```
+
+**插件文件变更行为总结**：
+
+| 场景 | 内存操作 | 广播 SSE |
+|------|---------|---------|
+| SHA256 未变 | 跳过 | ❌ |
+| SHA256 变化 + manifest 提取成功 + 已启用 | unload + reload | ✅ `{"plugin":["id"]}` |
+| SHA256 变化 + manifest 提取成功 + 未启用 | 仅更新 DB | ✅ `{"plugin":["id"]}` |
+| SHA256 变化 + manifest 提取失败 + 已启用 | unload + Enabled=false | ❌（潜在 bug） |
+| SHA256 变化 + manifest 提取失败 + 未启用 | 仅更新 DB + LastError | ❌（潜在 bug） |
+| .ndp 文件被删除 + 已启用 | unload + DB 删除 | ✅ `{"plugin":["id"]}` |
+| .ndp 文件被删除 + 未启用 | 仅 DB 删除 | ✅ `{"plugin":["id"]}` |
+
 ### 3.4 用户（User）变更完整链路
 
-#### 3.4.1 用户编辑
+用户管理的三种操作（修改基础信息、修改库关联、删除用户）在后端有**完全不同**的广播行为，需要仔细区分。
+
+#### 3.4.1 修改用户基础信息
 
 **前端入口**：`ui/src/user/UserEdit.jsx#L83-L105`
 
-用户编辑有一个特殊的"库选择"字段 `LibrarySelectionField`，通过 wrapperDataProvider 的 `updateUser()` 处理两阶段提交：
+修改用户名、密码、邮箱、管理员权限等基础信息：
 
 ```
 UserEdit.save()
@@ -415,36 +502,144 @@ UserEdit.save()
   ├─ useMutation()
   │   type: 'update'
   │   resource: 'user'
-  │   payload: { id, data: { userName, name, email, isAdmin, libraryIds, ... } }
+  │   payload: { id, data: { userName, name, email, isAdmin, ... } }
   │
   ▼
 wrapperDataProvider.update('user', params)  [wrapperDataProvider.js#L178-L184]
   │
   ▼
-updateUser(params)  [wrapperDataProvider.js#L128-L146]
+updateUser(params) 阶段 1  [wrapperDataProvider.js#L128-L146]
   │
-  ├─ 阶段 1：先更新用户基本信息
-  │   dataProvider.update('user', { ...params, data: userData })
-  │   ↓
-  │   PUT /api/user/{id}
-  │   Body: { "userName": "...", "name": "...", "isAdmin": false, ... }
-  │   (不含 libraryIds 字段)
+  ▼
+PUT /api/user/{id}
+  Body: { "userName": "...", "name": "...", "email": "...", ... }
   │
-  └─ 阶段 2：如果非 admin 用户且指定了 libraryIds：
+  ▼
+Go 后端 Router
+  │
+  ▼
+userRepositoryWrapper.Update(id, entity)  [core/user.go#L57-L60]
+  │
+  └─ 直接委托给底层 UserRepository.Update()
+     ↓
+     仅更新 DB，**不调用 broker.SendBroadcastMessage()**
+     ❌ 无 SSE 广播
+```
+
+**关键代码**（`core/user.go` L57-L60）：
+
+```go
+func (r *userRepositoryWrapper) Update(id string, entity any, cols ...string) error {
+    return r.UserRepository.(rest.Persistable).Update(id, entity, cols...)
+}
+```
+
+`Update()` 方法完全透传到底层，**没有任何事件广播逻辑**。同理，`Save()`（新建用户）也是直接透传，不广播事件。
+
+> 🔍 **行为结论**：修改用户基础信息（用户名、密码、邮箱、isAdmin 等）后，**所有在线客户端都不会收到 SSE 刷新通知**。如果另一个管理员打开了用户列表页面，他必须手动刷新浏览器才能看到变更。
+
+#### 3.4.2 修改用户库关联
+
+**前端入口**：同上，UserEdit 中的 `LibrarySelectionField` 组件
+
+当为非管理员用户分配/取消库访问权限时，走独立的 API 端点：
+
+```
+UserEdit.save()
+  │
+  ▼
+updateUser(params) 阶段 2  [wrapperDataProvider.js#L140-L146]
+  │
+  └─ if !userData.isAdmin && libraryIds !== undefined:
       handleUserLibraryAssociation(userId, libraryIds)
         ↓
         PUT /api/user/{id}/library
         Body: { "libraryIds": ["1", "3"] }
+  │
+  ▼
+Go 后端 Router → libraryService.SetUserLibraries()
+  [core/library.go#L69-L105]
+  │
+  ├─ 1) 校验：admin 用户不能手动分配，普通用户至少 1 个库
+  ├─ 2) s.ds.User(ctx).SetUserLibraries(userID, libraryIDs)  ← 更新 DB
+  │
+  └─ 3) ✅ 广播 SSE 事件：
+      event := &events.RefreshResource{}
+      event = event.With("user", userID).With("library", libIDs...)
+      s.broker.SendBroadcastMessage(ctx, event)
 ```
 
-#### 3.4.2 用户删除
+**关键代码**（`core/library.go` L99-L104）：
+
+```go
+// Send refresh event to all clients
+event := &events.RefreshResource{}
+libIDs := slice.Map(libraryIDs, func(id int) string { return strconv.Itoa(id) })
+event = event.With("user", userID).With("library", libIDs...)
+s.broker.SendBroadcastMessage(ctx, event)
+```
+
+> 🔍 **行为结论**：修改用户库关联后，**会同时广播 `user` 和 `library` 两个资源的刷新事件**。所有在线客户端的用户列表和库列表都会自动刷新。
+
+#### 3.4.3 用户删除
 
 **前端入口**：`ui/src/user/DeleteUserButton.jsx`（react-admin 标准删除按钮）
 
-后端 `core/user.go` 的 `userRepositoryWrapper.Delete()` 删除用户后：
-- 级联清理插件用户权限引用表
-- 调用 `pluginManager.UnloadDisabledPlugins()` 卸载因用户删除导致权限不满足的插件
-- 广播 SSE `RefreshResource{user: [id]}`
+```
+DELETE /api/user/{id}
+  │
+  ▼
+userRepositoryWrapper.Delete(id)  [core/user.go#L62-L75]
+  │
+  ├─ 1) 底层 Delete(id)  ← DB 级联清理
+  │   └─ 清理 plugin_user 权限引用表
+  │
+  ├─ 2) r.pluginManager.UnloadDisabledPlugins(r.ctx)
+  │   │   [plugins/manager.go#L546-L588]
+  │   │
+  │   ├─ 查询 DB 中所有 enabled=false 的插件
+  │   ├─ 检查是否仍在内存中（m.plugins map）
+  │   ├─ 对仍在内存中的执行 unloadPlugin()
+  │   │   ├─ delete(m.plugins, id)
+  │   │   ├─ plugin.Close()
+  │   │   └─ compiledPlugin.Close(ctx)
+  │   │
+  │   └─ 如果有卸载的插件：
+  │      m.sendPluginRefreshEvent(ctx, unloaded...)
+  │      ↓
+  │      广播 {"plugin": ["id1", "id2"]}
+  │
+  └─ ❌ **没有直接广播 user 资源的刷新事件！**
+```
+
+**关键代码**（`core/user.go` L62-L75）：
+
+```go
+func (r *userRepositoryWrapper) Delete(id string) error {
+    err := r.UserRepository.(rest.Persistable).Delete(id)
+    if err != nil {
+        return err
+    }
+    r.pluginManager.UnloadDisabledPlugins(r.ctx)
+    return nil
+}
+```
+
+注意：`Delete()` 方法本身**没有调用 broker.SendBroadcastMessage() 广播 user 事件**！
+
+> 🔍 **行为结论**：
+> - 用户删除后，**不会直接广播 `user` 资源的刷新事件**
+> - 只有当删除用户导致某些插件因权限不满足而被卸载时，才会**间接广播 `plugin` 资源的刷新事件**
+> - 其他在线客户端的用户列表不会自动刷新，需要手动刷新
+
+#### 3.4.4 用户管理广播行为总结
+
+| 操作 | 直接广播 SSE | 间接广播 SSE | 前端自动刷新 |
+|------|-------------|-------------|-------------|
+| 修改用户基础信息（用户名、密码等） | ❌ 无 | ❌ 无 | ❌ 需手动刷新 |
+| 修改用户库关联 | ✅ `{"user":["id"], "library":["1","3"]}` | ❌ 无 | ✅ 用户列表 + 库列表自动刷新 |
+| 删除用户 | ❌ 无 | ✅ `{"plugin":["id"]}`（如果有插件被卸载） | ⚠️ 仅插件列表自动刷新，用户列表需手动刷新 |
+| 新建用户 | ❌ 无 | ❌ 无 | ❌ 需手动刷新 |
 
 ### 3.5 Subsonic API 调用链路
 
@@ -602,32 +797,77 @@ appConfig := map[string]any{
 
 ## 六、总结：热加载能力矩阵
 
-| 设置类别 | 前端入口组件 | 请求方法与路径 | 持久化 | 内存生效 | 前端生效 | 触发副作用 |
-|---------|------------|--------------|--------|---------|---------|-----------|
-| 服务器配置 `conf.Server` | (无，只读) | GET /api/config/ | ✅ 文件 | ❌ 需重启 | ❌ 需刷新 | — |
-| 编辑音乐库 | LibraryEdit.jsx | PUT /api/library/{id} | ✅ DB | ✅ 立即 | ✅ SSE | 重启监控 + 触发扫描 |
-| 新建音乐库 | LibraryCreate.jsx | POST /api/library | ✅ DB | ✅ 立即 | ✅ SSE | 启动监控 + 触发扫描 |
-| 删除音乐库 | DeleteLibraryButton.jsx | DELETE /api/library/{id} | ✅ DB | ✅ 立即 | ✅ SSE | 清理插件权限 |
-| 插件配置/权限 | PluginShow.jsx Save 按钮 | PUT /api/plugin/{id} | ✅ DB | ✅ 重载WASM | ✅ SSE | unload+load 插件 |
-| 插件启用切换 | ToggleEnabledSwitch.jsx | PUT /api/plugin/{id} | ✅ DB | ✅ 重载WASM | ✅ SSE | unload+load 插件 |
-| 插件文件 `.ndp` | (文件系统变更) | (无 API) | ✅ DB | ✅ 重载WASM | ✅ SSE | AutoReload 时自动 |
-| 编辑用户 | UserEdit.jsx | PUT /api/user/{id} + PUT /api/user/{id}/library | ✅ DB | ✅ 立即 | 需要时 | 级联插件权限 |
-| 删除用户 | DeleteUserButton.jsx | DELETE /api/user/{id} | ✅ DB | ✅ 立即 | 需要时 | 清理插件权限 |
-| 触发扫描 | LibraryScanButton.jsx | GET /rest/startScan | ✅ DB | ✅ 立即 | ✅ SSE | 全局 RefreshResource |
+### 6.1 完整矩阵（含前端链路）
+
+| 设置类别 | 前端入口组件 | 请求方法与路径 | 持久化 | 内存生效 | 前端自动生效 | SSE 广播内容 | 触发副作用 |
+|---------|------------|--------------|--------|---------|-------------|-------------|-----------|
+| 服务器配置 `conf.Server` | (无，只读) | GET /api/config/ | ✅ 文件 | ❌ 需重启 | ❌ 需刷新 | ❌ 无 | — |
+| 编辑音乐库 | LibraryEdit.jsx Save 按钮 | PUT /api/library/{id} | ✅ DB | ✅ 立即 | ✅ | `{"library":["id"]}` | 路径变化时重启监控 + 触发扫描 |
+| 新建音乐库 | LibraryCreate.jsx Save 按钮 | POST /api/library | ✅ DB | ✅ 立即 | ✅ | `{"library":["id"]}` | 启动监控 + 触发扫描 |
+| 删除音乐库 | DeleteLibraryButton.jsx | DELETE /api/library/{id} | ✅ DB | ✅ 立即 | ✅ | `{"library":["id"]}` | 停止监控 + 触发扫描 + 清理插件权限 |
+| 插件配置/权限 | PluginShow.jsx Save 按钮 | PUT /api/plugin/{id} | ✅ DB | ✅ 重载WASM | ✅ | `{"plugin":["id"]}` | unload+load 插件 + 权限门控检查 |
+| 插件启用切换 | ToggleEnabledSwitch.jsx | PUT /api/plugin/{id} | ✅ DB | ✅ 重载WASM | ✅ | `{"plugin":["id"]}` | unload+load 插件 |
+| 插件文件 `.ndp` 变更（SHA256 变 + 提取成功） | (文件系统事件) | 无 API | ✅ DB | ✅ 重载WASM | ✅ | `{"plugin":["id"]}` | AutoReload 时自动 |
+| 插件文件 `.ndp` 变更（SHA256 变 + 提取失败 + 已启用） | (文件系统事件) | 无 API | ✅ DB | ✅ 禁用（unload） | ❌ 需手动刷新 | ❌ 无（潜在 bug） | 插件被禁用但前端无通知 |
+| 插件文件 `.ndp` 被删除 | (文件系统事件) | 无 API | ✅ DB | ✅ unload | ✅ | `{"plugin":["id"]}` | AutoReload 时自动 |
+| 用户基础信息修改 | UserEdit.jsx Save 按钮 | PUT /api/user/{id} | ✅ DB | ✅ 立即 | ❌ 需手动刷新 | ❌ 无 | — |
+| 用户库关联修改 | UserEdit.jsx Save 按钮 | PUT /api/user/{id}/library | ✅ DB | ✅ 立即 | ✅ | `{"user":["id"], "library":["1","3"]}` | 权限校验 + 级联插件权限 |
+| 用户删除 | DeleteUserButton.jsx | DELETE /api/user/{id} | ✅ DB | ✅ 立即 | ⚠️ 仅插件自动刷新 | ⚠️ 仅 `{"plugin":["id"]}`（间接） | 级联清理 + UnloadDisabledPlugins |
+| 触发扫描 | LibraryScanButton.jsx | GET /rest/startScan | ✅ DB | ✅ 立即 | ✅ | 扫描完成后 `{"*":"*"}` | 全库扫描 + 全局 RefreshResource |
+
+### 6.2 关键不一致性总结
+
+| 模块 | 预期行为 | 实际行为 | 影响 |
+|------|---------|---------|------|
+| `.ndp` 提取失败 + 已启用 | 应广播 plugin 变更 | ❌ 不广播 | 前端显示"已启用"但实际已禁用，需手动刷新 |
+| 用户基础信息修改 | 应广播 user 变更 | ❌ 不广播 | 多管理员协作时数据不一致 |
+| 用户删除 | 应广播 user 变更 | ❌ 不广播（仅间接广播 plugin） | 其他管理员仍看到已删除用户 |
+
+### 6.3 核心数据结构一致性对比
+
+**音乐库（Library）** — 一致性最好：
+- 增删改 → 持久化 → 副作用（watcher/scanner）→ 广播 `library` 事件 → 所有前端自动刷新
+- 代码位置：`core/library.go` Save/Update/Delete 方法均显式调用 `broker.SendBroadcastMessage()`
+
+**插件（Plugin）** — API 触发一致，文件触发不一致：
+- REST API 触发的增删改 → `updatePluginSettings()` 或 Enable/Disable → 均调用 `sendPluginRefreshEvent()` ✅
+- 文件系统触发 → `updatePluginInDB()` 成功时广播 ✅，但提取失败时不广播 ❌
+
+**用户（User）** — 一致性最差：
+- `Save()` / `Update()` 方法完全透传，无任何广播 ❌
+- `Delete()` 方法不直接广播 user 事件 ❌
+- 只有通过 `libraryService.SetUserLibraries()` 修改库关联时才广播 ✅
+
+---
 
 **核心结论**：Navidrome 的"管理端设置变更热加载"主要体现在 **数据库驱动的运行时数据**（Library、Plugin、User 等），完整链路为：
 
 ```
 UI 组件交互 (useMutation/useUpdate)
-  → react-admin wrapperDataProvider
-    → httpClient (注入 JWT + Client-Id)
-      → Go Chi Router (JWT + admin 权限中间件)
-        → Repository Wrapper (DB 持久化 + 副作用)
-          → SSE Broker SendBroadcastMessage
-            → 所有在线前端 EventSource
-              → Redux activityReducer
-                → useResourceRefresh / useRefreshOnEvents
-                  → 局部 dataProvider.getMany() 或全局 refresh()
+  → react-admin wrapperDataProvider (统一资源路由 + 特殊处理)
+    → httpClient (注入 JWT + X-ND-Client-Unique-Id + 拦截 token 刷新)
+      → Go Chi Router (JWT 中间件 → adminOnly 中间件 → URL 解析)
+        → Repository Wrapper (DB 持久化 + 副作用执行 + SSE 广播)
+          ↓
+    ┌───── 分歧点：并非所有操作都广播 ─────┐
+    │                                       │
+    ✅ Library 所有操作 → 都广播          ❌ User 基础信息修改 → 不广播
+    ✅ Plugin API 操作 → 都广播           ❌ User 删除 → 不直接广播
+    ✅ Plugin 文件变更(成功) → 广播        ❌ Plugin 文件变更(失败) → 不广播
+    ✅ User 库关联修改 → 广播             
+          ↓
+          SSE Broker SendBroadcastMessage
+            ↓
+          所有在线前端 EventSource
+            ↓
+          Redux activityReducer → state.activity.refresh.lastReceived
+            ↓
+    ┌───── 前端 Hook 分发 ─────┐
+    │                          │
+    useResourceRefresh    useRefreshOnEvents
+    (资源局部 getMany)    (自定义回调)
+          ↓
+          UI 自动重渲染
 ```
 
 而 **服务器级配置**（`conf.Server`）不支持运行时热加载，变更后必须重启进程。
