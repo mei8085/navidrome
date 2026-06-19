@@ -899,29 +899,41 @@ appConfig := map[string]any{
 
 ### 6.1 完整矩阵（含前端链路）
 
-| 设置类别 | 前端入口组件 | 请求方法与路径 | 持久化 | 内存生效 | 前端自动生效 | SSE 广播内容 | 触发副作用 |
-|---------|------------|--------------|--------|---------|-------------|-------------|-----------|
-| 服务器配置 `conf.Server` | (无，只读) | GET /api/config/ | ✅ 文件 | ❌ 需重启 | ❌ 需刷新 | ❌ 无 | — |
-| 编辑音乐库 | LibraryEdit.jsx Save 按钮 | PUT /api/library/{id} | ✅ DB | ✅ 立即 | ✅ | `{"library":["id"]}` | 路径变化时重启监控 + 触发扫描 |
-| 新建音乐库 | LibraryCreate.jsx Save 按钮 | POST /api/library | ✅ DB | ✅ 立即 | ✅ | `{"library":["id"]}` | 启动监控 + 触发扫描 |
-| 删除音乐库 | DeleteLibraryButton.jsx | DELETE /api/library/{id} | ✅ DB | ✅ 立即 | ✅ | `{"library":["id"]}` | 停止监控 + 触发扫描 + 清理插件权限 |
-| 插件配置/权限 | PluginShow.jsx Save 按钮 | PUT /api/plugin/{id} | ✅ DB | ✅ 重载WASM | ✅ | `{"plugin":["id"]}` | unload+load 插件 + 权限门控检查 |
-| 插件启用切换 | ToggleEnabledSwitch.jsx | PUT /api/plugin/{id} | ✅ DB | ✅ 重载WASM | ✅ | `{"plugin":["id"]}` | unload+load 插件 |
-| 插件文件 `.ndp` 变更（SHA256 变 + 提取成功） | (文件系统事件) | 无 API | ✅ DB | ✅ 重载WASM | ✅ | `{"plugin":["id"]}` | AutoReload 时自动 |
-| 插件文件 `.ndp` 变更（SHA256 变 + 提取失败 + 已启用） | (文件系统事件) | 无 API | ✅ DB | ✅ 禁用（unload） | ❌ 需手动刷新 | ❌ 无（潜在 bug） | 插件被禁用但前端无通知 |
-| 插件文件 `.ndp` 被删除 | (文件系统事件) | 无 API | ✅ DB | ✅ unload | ✅ | `{"plugin":["id"]}` | AutoReload 时自动 |
-| 用户基础信息修改 | UserEdit.jsx Save 按钮 | PUT /api/user/{id} | ✅ DB | ✅ 立即 | ❌ 需手动刷新 | ❌ 无 | — |
-| 用户库关联修改 | UserEdit.jsx Save 按钮 | PUT /api/user/{id}/library | ✅ DB | ✅ 立即 | ✅ | `{"user":["id"], "library":["1","3"]}` | 权限校验 + 级联插件权限 |
-| 用户删除 | DeleteUserButton.jsx | DELETE /api/user/{id} | ✅ DB | ✅ 立即 | ⚠️ 仅插件自动刷新 | ⚠️ 仅 `{"plugin":["id"]}`（间接） | 级联清理 + UnloadDisabledPlugins |
-| 触发扫描 | LibraryScanButton.jsx | GET /rest/startScan | ✅ DB | ✅ 立即 | ✅ | 扫描完成后 `{"*":"*"}` | 全库扫描 + 全局 RefreshResource |
+以下内容按 **代码事实** 精确对应 3.3.4 节和 3.4 节的分析。
 
-### 6.2 关键不一致性总结
+| 设置类别 | 前端入口组件 | 请求方法与路径 | 持久化 | 内存操作 | SSE 广播内容 | 前端自动生效 | 副作用（DB 状态与其他） |
+|---------|------------|--------------|--------|---------|-------------|-------------|----------------------|
+| 服务器配置 `conf.Server` | (无，只读) | GET /api/config/ | ✅ 配置文件 | ❌ 需重启进程 | ❌ 无 | ❌ 需刷新浏览器 | — |
+| 编辑音乐库 | LibraryEdit.jsx Save 按钮 | PUT /api/library/{id} | ✅ DB Put | ✅ 立即生效 | `{"library":["id"]}` | ✅ | 路径变化时：重启 watcher + 触发扫描 |
+| 新建音乐库 | LibraryCreate.jsx Save 按钮 | POST /api/library | ✅ DB Put（新增） | ✅ 立即生效 | `{"library":["id"]}` | ✅ | 启动 watcher + 触发扫描 |
+| 删除音乐库 | DeleteLibraryButton.jsx | DELETE /api/library/{id} | ✅ DB Delete | ✅ 立即生效 | `{"library":["id"]}` | ✅ | 停止 watcher + 触发扫描 + `UnloadDisabledPlugins` |
+| 插件配置/权限修改 | PluginShow.jsx Save 按钮 | PUT /api/plugin/{id} | ✅ DB Put | ✅ 若启用则先 unload 再 reload | `{"plugin":["id"]}` | ✅ | 权限门控不满足时自动禁用 + `sendPluginRefreshEvent` |
+| 插件启用切换 | ToggleEnabledSwitch.jsx | PUT /api/plugin/{id} | ✅ DB Put（Enabled=true/false） | ✅ load / unload | `{"plugin":["id"]}` | ✅ | 启用时校验权限门控 |
+| 插件文件新增（.ndp） | (文件系统事件) | 无 API | ✅ DB Put（新增） | ❌ 不加载（未启用） | `{"plugin":["*"]}` | ✅ | `Enabled=false`（默认禁用），需管理员手动启用 |
+| 插件文件变更 + 提取成功 + 已启用 | (文件系统事件) | 无 API | ✅ DB Put（更新） | ✅ unload（从内存移除 + Close WASM） | `{"plugin":["id"]}` | ✅ | `Enabled=false`（强制禁用），清空 LastError，需手动重新启用 |
+| 插件文件变更 + 提取成功 + 未启用 | (文件系统事件) | 无 API | ✅ DB Put（更新） | ❌ 无操作（未加载） | `{"plugin":["id"]}` | ✅ | `Enabled=false`（保持禁用），更新 manifest / SHA256 |
+| 插件文件变更 + 提取失败 + 已启用 | (文件系统事件) | 无 API | ✅ DB Put（更新） | ✅ unload（从内存移除 + Close WASM） | ❌ 无 | ❌ 需手动刷新 | `Enabled=false`（禁用），写入 `LastError`，**遗漏广播**（潜在 bug） |
+| 插件文件变更 + 提取失败 + 未启用 | (文件系统事件) | 无 API | ✅ DB Put（更新） | ❌ 无操作（未加载） | ❌ 无 | ❌ 需手动刷新 | `Enabled=false`（保持禁用），写入 `LastError`，**遗漏广播**（潜在 bug） |
+| 插件文件删除 + 已启用 | (文件系统事件) | 无 API | ✅ DB Delete | ✅ unload（从内存移除 + Close WASM） | `{"plugin":["*"]}` | ✅ | 从 DB 彻底删除记录 |
+| 插件文件删除 + 未启用 | (文件系统事件) | 无 API | ✅ DB Delete | ❌ 无操作（未加载） | `{"plugin":["*"]}` | ✅ | 从 DB 彻底删除记录 |
+| 用户基础信息修改 | UserEdit.jsx Save 按钮 | PUT /api/user/{id} | ✅ DB Put | ✅ 立即生效 | ❌ 无 | ❌ 需手动刷新 | — |
+| 用户库关联修改 | UserEdit.jsx Save 按钮 | PUT /api/user/{id}/library | ✅ DB 更新关联表 | ✅ 立即生效 | `{"user":["id"], "library":["1","3"]}` | ✅ | 校验 admin 不能手动分配 + 至少 1 个库 + 级联插件权限检查 |
+| 用户删除 | DeleteUserButton.jsx | DELETE /api/user/{id} | ✅ DB Delete（级联清理） | ✅ 立即生效 | ⚠️ 仅 `{"plugin":["id"]}`（间接） | ⚠️ 仅插件列表自动刷新 | 级联清理 plugin_user 引用 + `UnloadDisabledPlugins` |
+| 触发扫描 | LibraryScanButton.jsx | GET /rest/startScan | ✅ DB（扫描进度） | ✅ 立即生效 | 扫描完成后 `{"*":"*"}` | ✅ | 全库扫描 + 扫描完成时全局 RefreshResource |
 
-| 模块 | 预期行为 | 实际行为 | 影响 |
-|------|---------|---------|------|
-| `.ndp` 提取失败 + 已启用 | 应广播 plugin 变更 | ❌ 不广播 | 前端显示"已启用"但实际已禁用，需手动刷新 |
-| 用户基础信息修改 | 应广播 user 变更 | ❌ 不广播 | 多管理员协作时数据不一致 |
-| 用户删除 | 应广播 user 变更 | ❌ 不广播（仅间接广播 plugin） | 其他管理员仍看到已删除用户 |
+### 6.2 关键不一致性与设计选择总结
+
+以下区分**有意的设计选择**和**遗漏/不一致**：
+
+| 模块 / 场景 | 行为 | 性质 | 代码位置 |
+|------------|------|------|---------|
+| 插件文件变更后强制 `Enabled=false` | `updatePluginInDB()` 无论之前是否启用都写 `Enabled=false` | ✅ 设计选择（安全默认） | `plugins/manager_sync.go` L77-L96 |
+| 新增 / 删除插件广播 `{"plugin":["*"]}` 通配符 | 使用 `events.Any` 常量触发全量刷新 | ✅ 设计选择（列表页整体刷新简单可靠） | `plugins/manager_sync.go` L71, L111 |
+| 变更插件广播 `{"plugin":["id"]}` 具体 ID | 使用具体 plugin ID 精准刷新 | ✅ 设计选择（减少不必要请求） | `plugins/manager_sync.go` L94 |
+| `.ndp` 提取失败路径**不广播**任何事件 | 内联处理仅更新 DB，未调用 `sendPluginRefreshEvent` | ❌ 遗漏（潜在 bug） | `plugins/manager_watcher.go` L186-L198 |
+| 用户基础信息修改**不广播** user 事件 | `userRepositoryWrapper.Update()` 直接透传底层 | ❌ 不一致 | `core/user.go` L57-L60 |
+| 用户删除**不直接广播** user 事件 | `userRepositoryWrapper.Delete()` 仅调用 `UnloadDisabledPlugins` | ❌ 不一致 | `core/user.go` L62-L75 |
+| 库关联修改同时广播 `user` + `library` | `SetUserLibraries()` 同时 `With("user",...)` + `With("library",...)` | ✅ 设计选择（两个列表都需要更新） | `core/library.go` L99-L104 |
 
 ### 6.3 核心数据结构一致性对比
 
