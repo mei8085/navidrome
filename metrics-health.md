@@ -190,28 +190,27 @@ if count, folderCount, err := s.getCounters(ctx); err != nil {
 
 ##### 对巡检判断的影响
 
-| 影响点 | 说明 | 巡检建议 |
-|--------|------|----------|
-| **指标不完整** | 至少 5 种失败场景不会进入指标 | 不能仅凭 `plugin_request_count` 判断总调用量 |
-| **失败率偏低** | Context 取消、实例创建失败等错误不计入指标 | 计算失败率时，实际失败率可能高于指标显示值 20%-50% |
-| **静默失败** | 插件系统级故障（WASM 加载失败、序列化问题）完全无指标体现 | 需同时监控日志中的 `failed to create plugin`、`failed to marshal input` 等错误 |
-| **NotImplemented 盲区** | 大量可选接口未实现不会被发现 | 若预期插件应实现某些功能，需通过业务结果反向验证 |
-| **Context 取消混淆** | 正常的客户端取消（如用户切换页面）与异常的服务端超时混在一起，且都不记录 | 高并发场景下无法区分是用户主动取消还是系统处理超时 |
+| 影响点 | 代码证据 | 巡检口径 |
+|--------|----------|----------|
+| **指标覆盖不完整** | 9 条退出路径中仅 4 条调用 `RecordPluginRequest`，5 条直接 return 不写指标（见上方对照表） | `plugin_request_count` 仅反映进入 `CallWithContext` 之后的部分调用，不能作为总调用量 |
+| **失败率分母偏小** | 分母仅包含走到 `RecordPluginRequest` 的调用，实例创建失败、序列化失败、Context 取消、NotImplemented 均不在分母中 | 指标显示的失败率是「已记录调用中的失败率」，不是「全部调用的失败率」，实际失败率无法仅从指标推算 |
+| **静默失败无指标** | 第 46、52、57、67、77 行均直接 return，无任何 `RecordPluginRequest` 调用 | 需通过日志监控补充，日志关键词见下表 |
+| **NotImplemented 盲区** | 第 77 行被注释掉，`errNotImplemented` 错误不进指标 | 无法从指标判断插件是否实现了预期接口，需从业务返回值反向验证 |
+| **Context 取消无指标** | 第 65-67 行检测到 `ctx.Err() != nil` 后直接返回 | 请求超时、客户端断开、服务关闭均不体现在指标中，无法区分主动取消与异常超时 |
 
-##### 巡检告警规则修正（基于代码事实）
+##### 需日志补充监控的静默场景
 
-```yaml
-# 插件调用失败率告警（需考虑指标不完整，阈值设低一些）
-- alert: PluginHighFailureRate
-  expr: sum(rate(plugin_request_count{ok="false"}[5m])) / sum(rate(plugin_request_count[5m])) > 0.05  # 原 0.1 → 修正为 0.05
-  for: 2m
-  labels:
-    severity: warning
+| 代码位置 | 日志关键词 | 场景 |
+|----------|------------|------|
+| 第 46 行 | `"failed to create plugin"` | WASM 实例创建失败 |
+| 第 52 行 | `"Plugin function not found"` | 插件未导出该函数 |
+| 第 57 行 | 无日志（`json.Marshal` 错误直接 return） | 输入序列化失败 |
+| 第 66 行 | `"Plugin call cancelled"` | Context 取消 |
+| 第 75 行 | `"Plugin function not implemented"` | 函数存在但未实现 |
 
-# 补充：通过日志监控插件系统级错误（Promtail + Loki 示例）
-#  count_over_time({job="navidrome"} |= "failed to create plugin" [5m]) > 0
-#  count_over_time({job="navidrome"} |= "failed to marshal input" [5m]) > 0
-```
+##### 本节告警示例
+
+本节告警示例已合并至第五节，此处不再重复。
 
 ##### 记录指标的三种场景总结
 
@@ -372,14 +371,107 @@ func startInsightsCollector(ctx context.Context) func() error {
 - Prometheus 指标 `db_model_totals` 是否正常（非零或有值）
 - `/api/inspect` 端点（Admin 权限）返回正常
 
-### 5.2 巡检指标速查（Prometheus）
+### 5.2 巡检告警规则（统一版本）
 
-**巡检告警规则建议**：
+以下告警规则按指标链路分类，每条规则均标注代码依据和已知盲区。
 
+```yaml
+# 
+# 媒体扫描
+# 
+
+# 代码依据：scanner/controller.go ScanFolders() 在扫描结束后调用
+#   WriteAfterScanMetrics(ctx, success)，写入 media_scan_last 和 media_scans
+# 已知盲区：无。扫描成功/失败均会记录指标。
+
+- alert: MediaScanStale
+  expr: time() - media_scan_last{success="true"} > 3 * 24 * 3600
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "超过 3 天无成功扫描"
+
+- alert: MediaScanAlwaysFailing
+  expr: increase(media_scans{success="false"}[1h]) > 0 and increase(media_scans{success="true"}[1h]) == 0
+  for: 30m
+  labels:
+    severity: critical
+  annotations:
+    summary: "扫描持续失败，1 小时内无成功记录"
+
+# 
+# HTTP 请求（Subsonic API）
+# 
+
+# 代码依据：server/subsonic/middlewares.go recordStats() 在每个请求
+#   完成后调用 metrics.RecordRequest()，无论成功失败均记录。
+# 已知盲区：仅覆盖 Subsonic API 路由，Native API 和静态资源请求不记录。
+
+- alert: HighHTTPErrorRate
+  expr: |
+    sum(rate(http_request_count{status=~"5.."}[5m]))
+    / sum(rate(http_request_count[5m])) > 0.05
+  for: 2m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Subsonic API 5xx 错误率超过 5%"
+
+# 
+# 插件调用
+# 
+
+# 代码依据：plugins/manager_call.go callPluginFunction() 中，
+#   仅 4/9 条退出路径调用 RecordPluginRequest：
+#     OK CallWithContext 非取消错误   -> ok=false
+#     OK exit!=0 且非 notImplemented -> ok=false
+#     OK exit==0 且 JSON 反序列化成功 -> ok=true
+#     OK exit==0 且 JSON 反序列化失败 -> ok=false
+#   5 条路径不记录指标：实例创建失败、函数不存在、序列化失败、
+#   Context 取消、NotImplemented。
+#
+# 因此：
+#   - plugin_request_count 的分母仅含「已记录的调用」
+#   - 指标中 0% 失败率不代表「无任何失败」
+#   - 调用量突降可能意味着系统级故障进入了不记录指标的分支
+
+- alert: PluginHighFailureRate
+  expr: |
+    sum(rate(plugin_request_count{ok="false"}[5m]))
+    / sum(rate(plugin_request_count[5m])) > 0.05
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "已记录的插件调用中失败率超过 5%"
+    note: "该比率分母不含实例创建失败、Context取消、NotImplemented等不记录指标的场景"
+
+- alert: PluginCallVolumeDrop
+  expr: |
+    sum(rate(plugin_request_count[10m]))
+    < (sum(rate(plugin_request_count[6h] offset 10m)) * 0.3)
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: "已记录的插件调用量降至基线的 30% 以下"
+    note: "可能原因：插件 WASM 加载失败、输入序列化失败等不记录指标的系统级故障"
+    mechanism: "对比当前 10 分钟速率与 6 小时前同窗口速率，降幅超 70% 触发"
+
+# 
+# 日志补充监控（Loki / Promtail 示例）
+# 
+# 以下场景不写入 Prometheus 指标，需通过日志捕获：
+#
+#  count_over_time({job="navidrome"} |= "failed to create plugin" [5m]) > 0
+#  count_over_time({job="navidrome"} |= "Plugin function not found" [5m]) > 0
+#  count_over_time({job="navidrome"} |= "Plugin call cancelled" [5m]) > 0
+#  count_over_time({job="navidrome"} |= "Plugin function not implemented" [5m]) > 0
 ```yaml
 # 1. 媒体扫描长时间未执行或持续失败
 - alert: MediaScanStale
-  expr: time() - navidrome_media_scan_last{success="true"} > 3 * 24 * 3600
+  expr: time() - media_scan_last{success="true"} > 3 * 24 * 3600
   for: 5m
   labels:
     severity: warning
@@ -393,7 +485,7 @@ func startInsightsCollector(ctx context.Context) func() error {
 
 # 3. 插件调用高失败率
 - alert: PluginHighFailureRate
-  expr: sum(rate(plugin_request_count{ok="false"}[5m])) / sum(rate(plugin_request_count[5m])) > 0.1
+  expr: sum(rate(plugin_request_count{ok="false"}[5m])) / sum(rate(plugin_request_count[5m])) > 0.05
   for: 5m
   labels:
     severity: warning
@@ -421,10 +513,14 @@ cmd/root.go (启动入口)
   │     │                       ├─ WriteInitialMetrics() ──► 数据库 CountAll
   │     │                       ├─ WriteAfterScanMetrics() ◄── scanner/controller.go (扫描结束回调)
   │     │                       ├─ RecordRequest()        ◄── server/subsonic/middlewares.go (recordStats)
-  │     │                       ├─ RecordPluginRequest()  ◄── plugins/manager_call.go (callFunction)
-  │     │                       └─ GetHandler() ──► MountRouter("/metrics")
+  │     │                       │
+  │     │                       └─ RecordPluginRequest()  ◄── plugins/manager_call.go (callPluginFunction)
+  │     │                                                ║
+  │     │                                                ║  ⚠️  注意：仅部分分支记录
+  │     │                                                ║  ✅ 记录：执行错误/非零退出码/反序列化失败
+  │     │                                                ║  ❌ 不记录：实例失败/函数不存在/序列化失败/Context取消/NotImplemented
   │     │
-  │     └─ MountRouter("/metrics")
+  │     └─ GetHandler() ──► MountRouter("/metrics")
   │
   ├── CreateInsights() ──► core/metrics/insights.go
   │     │                       │
